@@ -55,6 +55,12 @@ This opens an interactive TUI where you can record, transcribe, and copy text.
 | `?` | Show keybindings |
 | `q` | Quit |
 
+### Update
+
+```
+dikt update
+```
+
 ### Single-shot mode
 
 ```bash

@@ -34,7 +34,7 @@ const moveTo = (row, col = 1) => `${ESC}${row};${col}H`;
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
-const VERSION = '1.0.0';
+const VERSION = '1.0.1';
 const CONFIG_BASE = process.env.XDG_CONFIG_HOME || path.join(os.homedir(), '.config');
 const CONFIG_DIR = path.join(CONFIG_BASE, 'dikt');
 const CONFIG_FILE = path.join(CONFIG_DIR, 'config.json');
@@ -128,7 +128,7 @@ function readSecret(prompt) {
         default:
           if (ch.charCodeAt(0) >= 32) {
             secret += ch;
-            process.stderr.write('*');
+            process.stderr.write('*'.repeat(ch.length));
           }
           break;
       }
@@ -860,6 +860,25 @@ async function main() {
     process.exit(EXIT_OK);
   }
 
+  if (args.includes('--update') || args[0] === 'update') {
+    try {
+      const resp = await fetch('https://registry.npmjs.org/dikt/latest');
+      const data = await resp.json();
+      const latest = data.version;
+      if (latest === VERSION) {
+        console.log(`dikt v${VERSION} is already up to date.`);
+        process.exit(EXIT_OK);
+      }
+      console.log(`Updating dikt v${VERSION} → v${latest}...`);
+      execFileSync('npm', ['install', '-g', 'dikt@latest'], { stdio: 'inherit' });
+      console.log(`Updated to dikt v${latest}.`);
+    } catch (err) {
+      console.error(`Update failed: ${err.message}`);
+      process.exit(EXIT_DEPENDENCY);
+    }
+    process.exit(EXIT_OK);
+  }
+
   if (args.includes('--help') || args.includes('-h')) {
     console.log(`dikt v${VERSION} — voice dictation for the terminal
 
@@ -867,9 +886,11 @@ Usage: dikt [options] [command]
 
 Commands:
   setup                      Reconfigure API key and model
+  update                     Update dikt to the latest version
 
 Options:
   --setup                    Run setup wizard
+  --update                   Update to latest version
   --json                     Record once, output JSON to stdout
   -q, --quiet                Record once, print transcript to stdout
   --no-input                 Fail if config is missing (no wizard)
@@ -890,6 +911,7 @@ Examples:
   dikt -q                    Record once, print transcript to stdout
   dikt --json                Record once, output JSON to stdout
   dikt -q | claude           Dictate a prompt to Claude Code
+  dikt update                Update to the latest version
 
 Environment variables:
   DIKT_API_KEY               Override API key from config
