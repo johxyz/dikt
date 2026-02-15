@@ -1,0 +1,26 @@
+{
+  "name": "dikt",
+  "version": "1.0.0",
+  "description": "Voice dictation for the terminal. Record, transcribe, copy — zero dependencies.",
+  "type": "module",
+  "bin": {
+    "dikt": "./cli.mjs"
+  },
+  "files": [
+    "cli.mjs"
+  ],
+  "keywords": [
+    "dictation",
+    "voice",
+    "transcription",
+    "speech-to-text",
+    "cli",
+    "terminal",
+    "whisper",
+    "mistral"
+  ],
+  "license": "MIT",
+  "engines": {
+    "node": ">=20.0.0"
+  }
+}
