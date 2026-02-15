@@ -179,8 +179,17 @@ function checkSox() {
   try {
     execFileSync('sox', ['--version'], { stdio: 'pipe' });
   } catch {
-    process.stderr.write(`\n${RED}${BOLD}  sox not found.${RESET}\n`);
-    process.stderr.write(`  Install it with: ${BOLD}brew install sox${RESET}\n\n`);
+    process.stderr.write(`\n${RED}${BOLD}  sox not found.${RESET}\n\n`);
+    process.stderr.write(`  dikt requires sox for audio recording. Install it:\n\n`);
+    if (process.platform === 'darwin') {
+      process.stderr.write(`    ${BOLD}brew install sox${RESET}\n\n`);
+    } else if (process.platform === 'win32') {
+      process.stderr.write(`    ${BOLD}choco install sox${RESET}  or  ${BOLD}scoop install sox${RESET}\n\n`);
+    } else {
+      process.stderr.write(`    ${BOLD}sudo apt install sox${RESET}  (Debian/Ubuntu)\n`);
+      process.stderr.write(`    ${BOLD}sudo dnf install sox${RESET}  (Fedora)\n`);
+      process.stderr.write(`    ${BOLD}sudo pacman -S sox${RESET}  (Arch)\n\n`);
+    }
     process.exit(EXIT_DEPENDENCY);
   }
 }

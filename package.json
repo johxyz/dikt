@@ -1,7 +1,7 @@
 {
   "name": "dikt",
   "version": "1.0.0",
-  "description": "Voice dictation for the terminal. Record, transcribe, copy — zero dependencies.",
+  "description": "Voice dictation for the terminal.",
   "type": "module",
   "bin": {
     "dikt": "./cli.mjs"
@@ -19,8 +19,17 @@
     "whisper",
     "mistral"
   ],
+  "author": "johxyz",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/johxyz/dikt.git"
+  },
+  "homepage": "https://github.com/johxyz/dikt",
   "license": "MIT",
   "engines": {
     "node": ">=20.0.0"
+  },
+  "scripts": {
+    "postinstall": "node -e \"try{require('child_process').execFileSync('sox',['--version'],{stdio:'pipe'})}catch{console.log('\\n  Note: dikt requires sox for audio recording.\\n  Install it: brew install sox (macOS) / sudo apt install sox (Linux)\\n')}\""
   }
 }
