@@ -748,29 +748,105 @@ async function runSetup() {
   renderAll();
 }
 
+// ── Audio helpers ─────────────────────────────────────────────────────────────
+
+const SILENCE_THRESHOLD = Math.round(32768 * 0.01); // 1% of max 16-bit amplitude
+
+function createWavHeader(dataSize) {
+  const buf = Buffer.alloc(44);
+  buf.write('RIFF', 0);
+  buf.writeUInt32LE(36 + dataSize, 4);
+  buf.write('WAVE', 8);
+  buf.write('fmt ', 12);
+  buf.writeUInt32LE(16, 16);
+  buf.writeUInt16LE(1, 20);         // PCM
+  buf.writeUInt16LE(1, 22);         // mono
+  buf.writeUInt32LE(16000, 24);     // sample rate
+  buf.writeUInt32LE(32000, 28);     // byte rate (16000 * 1 * 2)
+  buf.writeUInt16LE(2, 32);         // block align
+  buf.writeUInt16LE(16, 34);        // bits per sample
+  buf.write('data', 36);
+  buf.writeUInt32LE(dataSize, 40);
+  return buf;
+}
+
+function peakAmplitude(chunk) {
+  let peak = 0;
+  for (let i = 0; i < chunk.length - 1; i += 2) {
+    const abs = Math.abs(chunk.readInt16LE(i));
+    if (abs > peak) peak = abs;
+  }
+  return peak;
+}
+
+async function transcribeBuffer(rawChunks, signal) {
+  const rawData = Buffer.concat(rawChunks);
+  const wavData = Buffer.concat([createWavHeader(rawData.length), rawData]);
+  const blob = new Blob([wavData], { type: 'audio/wav' });
+  const file = new File([blob], 'recording.wav', { type: 'audio/wav' });
+  const fd = new FormData();
+  fd.append('file', file);
+  fd.append('model', config.model);
+  if (config.language) fd.append('language', config.language);
+  if (config.temperature != null) fd.append('temperature', String(config.temperature));
+  if (config.contextBias) fd.append('context_bias', config.contextBias);
+
+  const t0 = Date.now();
+  const resp = await fetch('https://api.mistral.ai/v1/audio/transcriptions', {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${config.apiKey}` },
+    body: fd,
+    signal: signal || AbortSignal.timeout(30_000),
+  });
+  const latency = Date.now() - t0;
+
+  if (!resp.ok) {
+    const raw = await resp.text().catch(() => '');
+    throw new Error(raw || `HTTP ${resp.status}`);
+  }
+
+  const data = await resp.json();
+  const text = (data.text || '').trim();
+  return { text, latency };
+}
+
 // ── Single-shot mode ──────────────────────────────────────────────────────────
 
 async function runOnce(flags) {
-  const recFile = path.join(os.tmpdir(), `dikt-${Date.now()}.wav`);
-
   try {
-    // Record with silence detection via sox silence effect
+    // Record raw PCM to stdout — silence detection handled in Node.js
     const recProc = spawn('rec', [
-      '-q', '-r', '16000', '-c', '1', '-b', '16',
-      recFile,
-      'silence', '1', '0.1', '1%', '1', '2.0', '1%',
+      '-q', '-r', '16000', '-c', '1', '-b', '16', '-t', 'raw', '-',
     ], {
-      stdio: ['ignore', 'ignore', 'pipe'],
+      stdio: ['ignore', 'pipe', 'pipe'],
     });
 
     recProc.stderr.on('data', () => {});
 
-    // Ctrl+C stops recording gracefully
     const sigHandler = () => recProc.kill('SIGTERM');
     process.on('SIGINT', sigHandler);
 
+    const chunks = [];
+    let heardSound = false;
+    let lastSoundTime = Date.now();
     const recStart = Date.now();
+
+    recProc.stdout.on('data', (chunk) => {
+      chunks.push(chunk);
+      if (peakAmplitude(chunk) > SILENCE_THRESHOLD) {
+        heardSound = true;
+        lastSoundTime = Date.now();
+      }
+    });
+
+    const silenceTimer = setInterval(() => {
+      if (heardSound && Date.now() - lastSoundTime > flags.silence * 1000) {
+        recProc.kill('SIGTERM');
+      }
+    }, 100);
+
     await new Promise((resolve) => recProc.on('close', resolve));
+    clearInterval(silenceTimer);
     process.removeListener('SIGINT', sigHandler);
     const duration = (Date.now() - recStart) / 1000;
 
@@ -784,33 +860,8 @@ async function runOnce(flags) {
     const abortHandler = () => ac.abort();
     process.on('SIGINT', abortHandler);
 
-    const blob = await fs.openAsBlob(recFile, { type: 'audio/wav' });
-    const file = new File([blob], 'recording.wav', { type: 'audio/wav' });
-    const fd = new FormData();
-    fd.append('file', file);
-    fd.append('model', config.model);
-    if (config.language) fd.append('language', config.language);
-    if (config.temperature != null) fd.append('temperature', String(config.temperature));
-    if (config.contextBias) fd.append('context_bias', config.contextBias);
-
-    const t0 = Date.now();
-    const resp = await fetch('https://api.mistral.ai/v1/audio/transcriptions', {
-      method: 'POST',
-      headers: { Authorization: `Bearer ${config.apiKey}` },
-      body: fd,
-      signal: ac.signal,
-    });
-    const latency = Date.now() - t0;
+    const { text, latency } = await transcribeBuffer(chunks, ac.signal);
     process.removeListener('SIGINT', abortHandler);
-
-    if (!resp.ok) {
-      const raw = await resp.text().catch(() => '');
-      process.stderr.write(`Error: ${raw || `HTTP ${resp.status}`}\n`);
-      return EXIT_TRANSCRIPTION;
-    }
-
-    const data = await resp.json();
-    const text = (data.text || '').trim();
 
     if (!text) {
       process.stderr.write('No speech detected\n');
@@ -833,8 +884,106 @@ async function runOnce(flags) {
       process.stderr.write(`Error: ${err.message}\n`);
     }
     return EXIT_TRANSCRIPTION;
-  } finally {
-    try { fs.unlinkSync(recFile); } catch {}
+  }
+}
+
+// ── Stream mode ──────────────────────────────────────────────────────────────
+
+async function runStream(flags) {
+  try {
+    const recProc = spawn('rec', [
+      '-q', '-r', '16000', '-c', '1', '-b', '16', '-t', 'raw', '-',
+    ], {
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+
+    recProc.stderr.on('data', () => {});
+
+    let killed = false;
+    const killRec = () => { if (!killed) { killed = true; recProc.kill('SIGTERM'); } };
+    process.on('SIGINT', killRec);
+
+    let chunks = [];          // current chunk buffer (resets per pause)
+    let chunkHasAudio = false; // current chunk has sound (resets per pause)
+    let heardSound = false;    // ever heard sound (never resets)
+    let lastSoundTime = Date.now();
+    let chunkStart = Date.now();
+    let chunkIndex = 0;
+    const pending = [];
+
+    recProc.stdout.on('data', (chunk) => {
+      chunks.push(chunk);
+      if (peakAmplitude(chunk) > SILENCE_THRESHOLD) {
+        chunkHasAudio = true;
+        heardSound = true;
+        lastSoundTime = Date.now();
+      }
+    });
+
+    const checkTimer = setInterval(() => {
+      const silenceMs = Date.now() - lastSoundTime;
+
+      // Pause: send current chunk for transcription, keep recording
+      if (chunkHasAudio && silenceMs > flags.pause * 1000 && chunks.length > 0) {
+        const batch = chunks;
+        const duration = (Date.now() - chunkStart) / 1000;
+        const idx = chunkIndex++;
+        chunks = [];
+        chunkHasAudio = false;
+        chunkStart = Date.now();
+
+        const p = transcribeBuffer(batch)
+          .then(({ text, latency }) => {
+            if (!text) return;
+            const wordCount = text.split(/\s+/).filter(Boolean).length;
+            if (flags.json) {
+              process.stdout.write(JSON.stringify({ text, chunk: idx, duration: parseFloat(duration.toFixed(1)), latency, words: wordCount }) + '\n');
+            } else {
+              process.stdout.write(text + '\n');
+            }
+          })
+          .catch((err) => {
+            process.stderr.write(`Chunk ${idx} error: ${err.message}\n`);
+          });
+        pending.push(p);
+      }
+
+      // Stop: full silence threshold reached
+      if (heardSound && silenceMs > flags.silence * 1000) {
+        killRec();
+      }
+    }, 100);
+
+    await new Promise((resolve) => recProc.on('close', resolve));
+    clearInterval(checkTimer);
+    process.removeListener('SIGINT', killRec);
+
+    // Send any remaining audio that hasn't been sent yet
+    if (chunks.length > 0 && chunkHasAudio) {
+      const duration = (Date.now() - chunkStart) / 1000;
+      const idx = chunkIndex++;
+      try {
+        const { text, latency } = await transcribeBuffer(chunks);
+        if (text) {
+          const wordCount = text.split(/\s+/).filter(Boolean).length;
+          if (flags.json) {
+            process.stdout.write(JSON.stringify({ text, chunk: idx, duration: parseFloat(duration.toFixed(1)), latency, words: wordCount }) + '\n');
+          } else {
+            process.stdout.write(text + '\n');
+          }
+        }
+      } catch (err) {
+        process.stderr.write(`Chunk ${idx} error: ${err.message}\n`);
+      }
+    }
+
+    // Wait for any in-flight transcriptions to finish
+    await Promise.allSettled(pending);
+
+    return EXIT_OK;
+  } catch (err) {
+    process.stderr.write(`Error: ${err.message}\n`);
+    return EXIT_TRANSCRIPTION;
   }
 }
 
@@ -865,6 +1014,10 @@ async function main() {
     quiet: args.includes('--quiet') || args.includes('-q'),
     noInput: args.includes('--no-input'),
     setup: args.includes('--setup') || args[0] === 'setup',
+    stream: args.includes('--stream'),
+    silence: args.includes('--silence') ? parseFloat(args[args.indexOf('--silence') + 1]) || 2.0 : 2.0,
+    pause: args.includes('--pause') ? parseFloat(args[args.indexOf('--pause') + 1]) || 1.0 : 1.0,
+    language: args.includes('--language') ? args[args.indexOf('--language') + 1] || '' : '',
   };
 
   if (args.includes('--version')) {
@@ -905,6 +1058,10 @@ Options:
   --update                   Update to latest version
   --json                     Record once, output JSON to stdout
   -q, --quiet                Record once, print transcript to stdout
+  --stream                   Stream transcription chunks on pauses
+  --silence <seconds>        Silence duration before auto-stop (default: 2.0)
+  --pause <seconds>          Pause duration to split chunks (default: 1.0)
+  --language <code>          Language code, e.g. en, de, fr (default: auto)
   --no-input                 Fail if config is missing (no wizard)
   --no-color                 Disable colored output
   --version                  Show version
@@ -922,6 +1079,9 @@ Examples:
   dikt setup                 Reconfigure API key and model
   dikt -q                    Record once, print transcript to stdout
   dikt --json                Record once, output JSON to stdout
+  dikt -q --silence 5        Wait longer before auto-stopping
+  dikt --stream              Stream chunks as you speak
+  dikt --stream --json       Stream chunks as JSON Lines
   dikt -q | claude           Dictate a prompt to Claude Code
   dikt update                Update to the latest version
 
@@ -963,6 +1123,7 @@ Requires: sox (brew install sox)`);
   }
 
   applyEnvOverrides(config);
+  if (flags.language) config.language = flags.language;
 
   const validation = validateConfig(config);
   if (!validation.valid) {
@@ -970,6 +1131,11 @@ Requires: sox (brew install sox)`);
       process.stderr.write(`Config error: ${err}\n`);
     }
     process.exit(EXIT_CONFIG);
+  }
+
+  // Stream mode: chunked transcription on pauses
+  if (flags.stream) {
+    process.exit(await runStream(flags));
   }
 
   // Single-shot mode: record once, output, exit
