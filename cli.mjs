@@ -25,6 +25,8 @@ const SHOW_CURSOR = `${ESC}?25h`;
 const CLEAR_LINE = `${ESC}2K`;
 const CLEAR_DOWN = `${ESC}J`;
 const CLEAR_SCREEN = `${ESC}2J${ESC}H`;
+const ALT_SCREEN_ON = `${ESC}?1049h`;
+const ALT_SCREEN_OFF = `${ESC}?1049l`;
 
 if (process.env.NO_COLOR != null || process.env.TERM === 'dumb' || process.argv.includes('--no-color')) {
   RESET = BOLD = DIM = RED = GREEN = YELLOW = GREY = WHITE = RED_BG = '';
@@ -34,7 +36,7 @@ const moveTo = (row, col = 1) => `${ESC}${row};${col}H`;
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
-const VERSION = '1.0.1';
+const VERSION = '1.0.2';
 const CONFIG_BASE = process.env.XDG_CONFIG_HOME || path.join(os.homedir(), '.config');
 const CONFIG_DIR = path.join(CONFIG_BASE, 'dikt');
 const CONFIG_FILE = path.join(CONFIG_DIR, 'config.json');
@@ -263,7 +265,13 @@ function render() {
       out += CLEAR_LINE + `   ${DIM}Press SPACE to start dictating.${RESET}` + '\n';
       out += CLEAR_LINE + `   ${DIM}Press ? for all keybindings.${RESET}` + '\n';
     } else {
-      const lines = wrapTranscript(w);
+      let lines = wrapTranscript(w);
+      // Cap transcript to available terminal rows to prevent overflow
+      const rows = process.stdout.rows || 24;
+      const availableRows = rows - 9; // header(2) + blank + keybar + blank + status + blank + meta + cleardown
+      if (availableRows > 0 && lines.length > availableRows) {
+        lines = lines.slice(lines.length - availableRows);
+      }
       for (const line of lines) {
         out += CLEAR_LINE + line + '\n';
       }
@@ -449,6 +457,9 @@ function toggleAutoCopy() {
 
 function startRecording() {
   state.error = '';
+  state.transcript = '';
+  state.wordCount = 0;
+  state.latency = 0;
 
   // Clean up previous recording file
   if (state.recFile) {
@@ -723,7 +734,7 @@ async function runSetup() {
   // Temporarily exit raw mode and detach keypress handler for the setup wizard
   process.stdin.removeListener('keypress', handleKey);
   process.stdin.setRawMode(false);
-  process.stdout.write(SHOW_CURSOR + CLEAR_SCREEN);
+  process.stdout.write(SHOW_CURSOR + ALT_SCREEN_OFF);
 
   config = await setupWizard();
   applyEnvOverrides(config);
@@ -731,7 +742,7 @@ async function runSetup() {
   process.stdin.resume();
   process.stdin.setRawMode(true);
   process.stdin.on('keypress', handleKey);
-  process.stdout.write(HIDE_CURSOR + CLEAR_SCREEN);
+  process.stdout.write(ALT_SCREEN_ON + HIDE_CURSOR + CLEAR_SCREEN);
   renderAll();
 }
 
@@ -838,8 +849,7 @@ function quit() {
 
   cleanupTempFiles();
 
-  const h = process.stdout.rows || 24;
-  process.stdout.write(SHOW_CURSOR + moveTo(h) + '\n');
+  process.stdout.write(SHOW_CURSOR + ALT_SCREEN_OFF);
   process.stdin.setRawMode(false);
   process.exit(EXIT_OK);
 }
@@ -968,8 +978,8 @@ Requires: sox (brew install sox)`);
   // Interactive TUI mode
   checkTTY();
 
-  // Enter raw TUI mode
-  process.stdout.write(HIDE_CURSOR + CLEAR_SCREEN);
+  // Enter raw TUI mode (alternate screen buffer prevents scrollback corruption)
+  process.stdout.write(ALT_SCREEN_ON + HIDE_CURSOR + CLEAR_SCREEN);
 
   readline.emitKeypressEvents(process.stdin);
   process.stdin.setRawMode(true);
@@ -987,7 +997,7 @@ Requires: sox (brew install sox)`);
 }
 
 main().catch((err) => {
-  process.stdout.write(SHOW_CURSOR);
+  process.stdout.write(SHOW_CURSOR + ALT_SCREEN_OFF);
   console.error(err);
   process.exit(EXIT_DEPENDENCY);
 });
