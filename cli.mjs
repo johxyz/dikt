@@ -36,7 +36,7 @@ const moveTo = (row, col = 1) => `${ESC}${row};${col}H`;
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
-const VERSION = '1.0.2';
+const VERSION = '1.0.3';
 const CONFIG_BASE = process.env.XDG_CONFIG_HOME || path.join(os.homedir(), '.config');
 const CONFIG_DIR = path.join(CONFIG_BASE, 'dikt');
 const CONFIG_FILE = path.join(CONFIG_DIR, 'config.json');
@@ -270,7 +270,9 @@ function render() {
       const rows = process.stdout.rows || 24;
       const availableRows = rows - 9; // header(2) + blank + keybar + blank + status + blank + meta + cleardown
       if (availableRows > 0 && lines.length > availableRows) {
-        lines = lines.slice(lines.length - availableRows);
+        const hidden = lines.length - availableRows + 1; // +1 to make room for the hint
+        lines = lines.slice(lines.length - availableRows + 1);
+        lines.unshift(`   ${DIM}↑ ${hidden} more line${hidden === 1 ? '' : 's'} above${RESET}`);
       }
       for (const line of lines) {
         out += CLEAR_LINE + line + '\n';

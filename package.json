@@ -1,6 +1,6 @@
 {
   "name": "dikt",
-  "version": "1.0.2",
+  "version": "1.0.3",
   "description": "Voice dictation for the terminal.",
   "type": "module",
   "bin": {
