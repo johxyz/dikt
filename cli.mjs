@@ -872,7 +872,7 @@ async function runSetup() {
   process.stdin.resume();
   process.stdin.setRawMode(true);
   process.stdin.on('keypress', handleKey);
-  process.stdout.write(ALT_SCREEN_ON + HIDE_CURSOR + CLEAR_SCREEN);
+  process.stdout.write(CLEAR_SCREEN + ALT_SCREEN_ON + HIDE_CURSOR + CLEAR_SCREEN);
   renderAll();
 }
 
