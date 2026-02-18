@@ -39,7 +39,7 @@ const moveTo = (row, col = 1) => `${ESC}${row};${col}H`;
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
-const VERSION = '1.1.2';
+const VERSION = '1.2.0';
 const CONFIG_BASE = process.env.XDG_CONFIG_HOME || path.join(os.homedir(), '.config');
 const CONFIG_DIR = path.join(CONFIG_BASE, 'dikt');
 const CONFIG_FILE = path.join(CONFIG_DIR, 'config.json');
@@ -576,6 +576,7 @@ function copy(text) {
   }
 
   const proc = spawn(cmd[0], cmd.slice(1), { stdio: ['pipe', 'ignore', 'ignore'] });
+  proc.on('error', () => {}); // swallow — clipboard is best-effort
   proc.stdin.end(text);
 
   state.mode = 'copied';
@@ -869,6 +870,9 @@ async function runSetup() {
   config = await setupWizard();
   applyEnvOverrides(config);
 
+  state.mode = state.transcript ? 'ready' : 'idle';
+  state.error = '';
+
   process.stdin.resume();
   process.stdin.setRawMode(true);
   process.stdin.on('keypress', handleKey);
@@ -1070,7 +1074,12 @@ async function runFile(flags) {
     const mime = mimeTypes[ext] || 'audio/wav';
     const file = new File([blob], path.basename(flags.file), { type: mime });
 
-    const result = await callTranscribeAPI(file, { timestamps: flags.timestamps, diarize: flags.diarize });
+    const ac = new AbortController();
+    const abortHandler = () => ac.abort();
+    process.on('SIGINT', abortHandler);
+
+    const result = await callTranscribeAPI(file, { signal: ac.signal, timestamps: flags.timestamps, diarize: flags.diarize });
+    process.removeListener('SIGINT', abortHandler);
 
     if (!result.text) {
       process.stderr.write('No speech detected\n');
@@ -1079,20 +1088,32 @@ async function runFile(flags) {
 
     const wordCount = result.text.split(/\s+/).filter(Boolean).length;
 
+    let output;
     if (flags.json) {
       const out = buildJsonOutput(
         { text: result.text, latency: result.latency, words: wordCount },
         { segments: result.segments, words: result.words, timestamps: flags.timestamps, diarize: flags.diarize },
       );
-      process.stdout.write(JSON.stringify(out) + '\n');
+      output = JSON.stringify(out, null, flags.output ? 2 : 0) + '\n';
     } else if (flags.diarize && result.segments) {
-      process.stdout.write(formatDiarizedText(result.segments) + '\n');
+      output = formatDiarizedText(result.segments) + '\n';
     } else {
-      process.stdout.write(result.text + '\n');
+      output = result.text + '\n';
+    }
+
+    if (flags.output) {
+      fs.writeFileSync(flags.output, output);
+      process.stderr.write(`Saved to ${flags.output}\n`);
+    } else {
+      process.stdout.write(output);
     }
 
     return EXIT_OK;
   } catch (err) {
+    if (err.name === 'AbortError') {
+      process.stderr.write('Aborted\n');
+      return EXIT_TRANSCRIPTION;
+    }
     process.stderr.write(`Error: ${err.message}\n`);
     return EXIT_TRANSCRIPTION;
   }
@@ -1158,16 +1179,24 @@ async function runOnce(flags) {
 
     const wordCount = result.text.split(/\s+/).filter(Boolean).length;
 
+    let output;
     if (flags.json) {
       const out = buildJsonOutput(
         { text: result.text, duration: parseFloat(duration.toFixed(1)), latency: result.latency, words: wordCount },
         { segments: result.segments, words: result.words, timestamps: flags.timestamps, diarize: flags.diarize },
       );
-      process.stdout.write(JSON.stringify(out) + '\n');
+      output = JSON.stringify(out, null, flags.output ? 2 : 0) + '\n';
     } else if (flags.diarize && result.segments) {
-      process.stdout.write(formatDiarizedText(result.segments) + '\n');
+      output = formatDiarizedText(result.segments) + '\n';
     } else {
-      process.stdout.write(result.text + '\n');
+      output = result.text + '\n';
+    }
+
+    if (flags.output) {
+      fs.writeFileSync(flags.output, output);
+      process.stderr.write(`Saved to ${flags.output}\n`);
+    } else {
+      process.stdout.write(output);
     }
 
     return EXIT_OK;
@@ -1204,6 +1233,7 @@ async function runStream(flags) {
     let chunkStart = Date.now();
     let chunkIndex = 0;
     const pending = [];
+    const outputParts = [];    // collect output for --output
 
     recProc.stdout.on('data', (chunk) => {
       chunks.push(chunk);
@@ -1230,17 +1260,23 @@ async function runStream(flags) {
           .then((result) => {
             if (!result.text) return;
             const wordCount = result.text.split(/\s+/).filter(Boolean).length;
+            let chunk_output;
             if (flags.json) {
               const out = buildJsonOutput(
                 { text: result.text, chunk: idx, duration: parseFloat(duration.toFixed(1)), latency: result.latency, words: wordCount },
                 { segments: result.segments, words: result.words, timestamps: flags.timestamps, diarize: flags.diarize },
               );
-              process.stdout.write(JSON.stringify(out) + '\n');
+              chunk_output = JSON.stringify(out, null, flags.output ? 2 : 0) + '\n';
             } else if (flags.diarize && result.segments) {
               const sep = flags.noNewline ? ' ' : '\n';
-              process.stdout.write(formatDiarizedText(result.segments) + sep);
+              chunk_output = formatDiarizedText(result.segments) + sep;
             } else {
-              process.stdout.write(result.text + (flags.noNewline ? ' ' : '\n'));
+              chunk_output = result.text + (flags.noNewline ? ' ' : '\n');
+            }
+            if (flags.output) {
+              outputParts[idx] = chunk_output;
+            } else {
+              process.stdout.write(chunk_output);
             }
           })
           .catch((err) => {
@@ -1267,17 +1303,23 @@ async function runStream(flags) {
         const result = await transcribeBuffer(chunks, { timestamps: flags.timestamps, diarize: flags.diarize });
         if (result.text) {
           const wordCount = result.text.split(/\s+/).filter(Boolean).length;
+          let chunk_output;
           if (flags.json) {
             const out = buildJsonOutput(
               { text: result.text, chunk: idx, duration: parseFloat(duration.toFixed(1)), latency: result.latency, words: wordCount },
               { segments: result.segments, words: result.words, timestamps: flags.timestamps, diarize: flags.diarize },
             );
-            process.stdout.write(JSON.stringify(out) + '\n');
+            chunk_output = JSON.stringify(out, null, flags.output ? 2 : 0) + '\n';
           } else if (flags.diarize && result.segments) {
             const sep = flags.noNewline ? ' ' : '\n';
-            process.stdout.write(formatDiarizedText(result.segments) + sep);
+            chunk_output = formatDiarizedText(result.segments) + sep;
           } else {
-            process.stdout.write(result.text + (flags.noNewline ? ' ' : '\n'));
+            chunk_output = result.text + (flags.noNewline ? ' ' : '\n');
+          }
+          if (flags.output) {
+            outputParts[idx] = chunk_output;
+          } else {
+            process.stdout.write(chunk_output);
           }
         }
       } catch (err) {
@@ -1288,8 +1330,13 @@ async function runStream(flags) {
     // Wait for any in-flight transcriptions to finish
     await Promise.allSettled(pending);
 
+    if (flags.output && outputParts.length) {
+      fs.writeFileSync(flags.output, outputParts.filter(Boolean).join(''));
+      process.stderr.write(`Saved to ${flags.output}\n`);
+    }
+
     // Final newline for --no-newline so shell prompt starts on a new line
-    if (flags.noNewline && !flags.json) process.stdout.write('\n');
+    if (!flags.output && flags.noNewline && !flags.json) process.stdout.write('\n');
 
     return EXIT_OK;
   } catch (err) {
@@ -1318,6 +1365,26 @@ function quit() {
 
 // ── Main ──────────────────────────────────────────────────────────────────────
 
+function flagVal(args, name, hint, { valid, numeric } = {}) {
+  const i = args.indexOf(name);
+  if (i === -1) return '';
+  const v = args[i + 1];
+  if (!v || v.startsWith('-')) {
+    const h = hint ? ` (${hint})` : '';
+    process.stderr.write(`Error: ${name} requires a value${h}\n`);
+    process.exit(EXIT_CONFIG);
+  }
+  if (valid && !valid.includes(v)) {
+    process.stderr.write(`Error: invalid value for ${name}: '${v}' (${hint})\n`);
+    process.exit(EXIT_CONFIG);
+  }
+  if (numeric && !Number.isFinite(parseFloat(v))) {
+    process.stderr.write(`Error: ${name} must be a number\n`);
+    process.exit(EXIT_CONFIG);
+  }
+  return v;
+}
+
 async function main() {
   const args = process.argv.slice(2);
   const flags = {
@@ -1326,13 +1393,14 @@ async function main() {
     noInput: args.includes('--no-input'),
     setup: args.includes('--setup') || args[0] === 'setup',
     stream: args.includes('--stream'),
-    silence: args.includes('--silence') ? (Number.isFinite(parseFloat(args[args.indexOf('--silence') + 1])) ? parseFloat(args[args.indexOf('--silence') + 1]) : 2.0) : 2.0,
-    pause: args.includes('--pause') ? parseFloat(args[args.indexOf('--pause') + 1]) || 1.0 : 1.0,
-    language: args.includes('--language') ? args[args.indexOf('--language') + 1] || '' : '',
-    file: args.includes('--file') ? args[args.indexOf('--file') + 1] || '' : '',
+    silence: args.includes('--silence') ? parseFloat(flagVal(args, '--silence', 'seconds', { numeric: true })) : 2.0,
+    pause: args.includes('--pause') ? parseFloat(flagVal(args, '--pause', 'seconds', { numeric: true })) : 1.0,
+    language: flagVal(args, '--language', 'e.g. en, de, fr'),
+    file: flagVal(args, '--file', 'path to audio file'),
     noNewline: args.includes('--no-newline') || args.includes('-n'),
-    timestamps: args.includes('--timestamps') ? args[args.indexOf('--timestamps') + 1] || '' : '',
+    timestamps: flagVal(args, '--timestamps', 'segment, word, or segment,word', { valid: ['segment', 'word', 'segment,word'] }),
     diarize: args.includes('--diarize'),
+    output: flagVal(args, '--output', 'path') || flagVal(args, '-o', 'path'),
   };
 
   if (args.includes('--version')) {
@@ -1375,6 +1443,7 @@ Options:
   -q, --quiet                Record once, print transcript to stdout
   --stream                   Stream transcription chunks on pauses
   --file <path>              Transcribe an audio file (no mic needed)
+  -o, --output <path>        Write output to file (.json auto-enables JSON)
   --silence <seconds>        Silence duration before auto-stop (default: 2.0)
   --pause <seconds>          Pause duration to split chunks (default: 1.0)
   --language <code>          Language code, e.g. en, de, fr (default: auto)
@@ -1404,6 +1473,8 @@ Examples:
   dikt -q | claude           Dictate a prompt to Claude Code
   dikt update                Update to the latest version
   dikt --file meeting.wav    Transcribe an existing audio file
+  dikt --file a.wav -o a.json  Transcribe to a JSON file
+  dikt --file a.wav -o a.txt   Transcribe to a text file
   dikt --stream --silence 0  Stream continuously until Ctrl+C
   dikt --stream -n           Stream as continuous flowing text
   dikt -q --json --diarize   Transcribe with speaker labels
@@ -1447,6 +1518,7 @@ Requires: sox (brew install sox)`);
   if (flags.language) config.language = flags.language;
   if (!flags.timestamps && config.timestamps) flags.timestamps = config.timestamps;
   if (!flags.diarize && config.diarize) flags.diarize = true;
+  if (flags.output && flags.output.endsWith('.json')) flags.json = true;
 
   const validation = validateConfig(config);
   if (!validation.valid) {
@@ -1457,14 +1529,27 @@ Requires: sox (brew install sox)`);
   }
 
   // Validate incompatible flag combinations
+  // Only error when both sides are CLI-passed. When one comes from config,
+  // let the explicit CLI flag win and silently drop the config value.
+  const cliLanguage = args.includes('--language');
+  const cliTimestamps = args.includes('--timestamps');
+  const cliDiarize = args.includes('--diarize');
   const lang = config.language;
   if (lang && flags.timestamps) {
-    process.stderr.write('Error: --timestamps and --language cannot be used together\n');
-    process.exit(EXIT_CONFIG);
+    if (cliLanguage && cliTimestamps) {
+      process.stderr.write('Error: --timestamps and --language cannot be used together\n');
+      process.exit(EXIT_CONFIG);
+    }
+    if (cliLanguage) flags.timestamps = '';
+    else config.language = '';
   }
   if (lang && flags.diarize) {
-    process.stderr.write('Error: --diarize and --language cannot be used together\n');
-    process.exit(EXIT_CONFIG);
+    if (cliLanguage && cliDiarize) {
+      process.stderr.write('Error: --diarize and --language cannot be used together\n');
+      process.exit(EXIT_CONFIG);
+    }
+    if (cliLanguage) flags.diarize = false;
+    else config.language = '';
   }
   if (flags.diarize && flags.stream) {
     process.stderr.write('Error: --diarize is not compatible with --stream, use -q --diarize instead\n');
@@ -1486,6 +1571,11 @@ Requires: sox (brew install sox)`);
   // Single-shot mode: record once, output, exit
   if (flags.json || flags.quiet) {
     process.exit(await runOnce(flags));
+  }
+
+  // Warn about flags that don't apply to interactive mode
+  if (flags.output) {
+    process.stderr.write(`Warning: --output is ignored in interactive mode. Use with --file, -q, or --stream.\n`);
   }
 
   // Interactive TUI mode
@@ -1514,7 +1604,7 @@ Requires: sox (brew install sox)`);
 }
 
 main().catch((err) => {
-  process.stdout.write(SHOW_CURSOR + ALT_SCREEN_OFF);
+  if (process.stdout.isTTY) process.stdout.write(SHOW_CURSOR + ALT_SCREEN_OFF);
   console.error(err);
   process.exit(EXIT_DEPENDENCY);
 });
