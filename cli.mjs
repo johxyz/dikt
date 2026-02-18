@@ -39,7 +39,7 @@ const moveTo = (row, col = 1) => `${ESC}${row};${col}H`;
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
-const VERSION = '1.1.0';
+const VERSION = '1.1.1';
 const CONFIG_BASE = process.env.XDG_CONFIG_HOME || path.join(os.homedir(), '.config');
 const CONFIG_DIR = path.join(CONFIG_BASE, 'dikt');
 const CONFIG_FILE = path.join(CONFIG_DIR, 'config.json');
