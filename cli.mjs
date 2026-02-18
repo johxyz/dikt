@@ -619,7 +619,8 @@ function startRecording() {
     stdio: ['ignore', 'ignore', 'pipe'],
   });
 
-  state.recProc.stderr.on('data', () => {}); // suppress sox warnings
+  let recStderr = '';
+  state.recProc.stderr.on('data', (d) => { recStderr += d; });
 
   state.recProc.on('error', (err) => {
     state.mode = 'error';
@@ -629,8 +630,14 @@ function startRecording() {
     renderAll();
   });
 
-  state.recProc.on('close', () => {
+  state.recProc.on('close', (code) => {
     state.recProc = null;
+    if (code && state.mode === 'recording') {
+      clearInterval(state.timerInterval);
+      state.mode = 'error';
+      state.error = recStderr.trim().split('\n').pop() || `rec exited with code ${code}`;
+      renderAll();
+    }
   });
 
   state.timerInterval = setInterval(() => {
