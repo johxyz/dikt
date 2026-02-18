@@ -1,6 +1,6 @@
 {
   "name": "dikt",
-  "version": "1.0.3",
+  "version": "1.1.0",
   "description": "Voice dictation for the terminal.",
   "type": "module",
   "bin": {
@@ -17,7 +17,9 @@
     "cli",
     "terminal",
     "whisper",
-    "mistral"
+    "mistral",
+    "diarization",
+    "voxtral"
   ],
   "author": "johxyz",
   "repository": {

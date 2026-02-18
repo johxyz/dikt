@@ -17,6 +17,9 @@ let DIM = `${ESC}2m`;
 let RED = `${ESC}31m`;
 let GREEN = `${ESC}32m`;
 let YELLOW = `${ESC}33m`;
+let BLUE = `${ESC}34m`;
+let MAGENTA = `${ESC}35m`;
+let CYAN = `${ESC}36m`;
 let GREY = `${ESC}90m`;
 let WHITE = `${ESC}37m`;
 let RED_BG = `${ESC}41m`;
@@ -29,14 +32,14 @@ const ALT_SCREEN_ON = `${ESC}?1049h`;
 const ALT_SCREEN_OFF = `${ESC}?1049l`;
 
 if (process.env.NO_COLOR != null || process.env.TERM === 'dumb' || process.argv.includes('--no-color')) {
-  RESET = BOLD = DIM = RED = GREEN = YELLOW = GREY = WHITE = RED_BG = '';
+  RESET = BOLD = DIM = RED = GREEN = YELLOW = BLUE = MAGENTA = CYAN = GREY = WHITE = RED_BG = '';
 }
 
 const moveTo = (row, col = 1) => `${ESC}${row};${col}H`;
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
-const VERSION = '1.0.3';
+const VERSION = '1.1.0';
 const CONFIG_BASE = process.env.XDG_CONFIG_HOME || path.join(os.homedir(), '.config');
 const CONFIG_DIR = path.join(CONFIG_BASE, 'dikt');
 const CONFIG_FILE = path.join(CONFIG_DIR, 'config.json');
@@ -88,91 +91,184 @@ function validateConfig(cfg) {
   return { valid: errors.length === 0, errors };
 }
 
-// ── Secret input ──────────────────────────────────────────────────────────────
+// ── Setup wizard (form-based) ─────────────────────────────────────────────────
 
-function readSecret(prompt) {
+const TIMESTAMPS_DISPLAY = { '': 'off', 'segment': 'segment', 'word': 'word', 'segment,word': 'both' };
+const TIMESTAMPS_VALUE = { 'off': '', 'segment': 'segment', 'word': 'word', 'both': 'segment,word' };
+
+async function setupWizard() {
+  const existing = loadConfig() || {};
+
+  const fields = [
+    { key: 'apiKey', label: 'API key', type: 'secret', value: '', display: existing.apiKey ? '••••' + existing.apiKey.slice(-4) : '', fallback: existing.apiKey || '' },
+    { key: 'model', label: 'Model', type: 'text', value: '', display: existing.model || 'voxtral-mini-latest', fallback: existing.model || 'voxtral-mini-latest' },
+    { key: 'language', label: 'Language', type: 'text', value: '', display: existing.language || 'auto', fallback: existing.language || '' },
+    { key: 'temperature', label: 'Temperature', type: 'text', value: '', display: existing.temperature != null ? String(existing.temperature) : 'default', fallback: existing.temperature != null ? String(existing.temperature) : '' },
+    { key: 'contextBias', label: 'Context bias', type: 'text', value: '', display: existing.contextBias || '', fallback: existing.contextBias || '' },
+    { key: 'timestamps', label: 'Timestamps', type: 'select', options: ['off', 'segment', 'word', 'both'], idx: ['off', 'segment', 'word', 'both'].indexOf(TIMESTAMPS_DISPLAY[existing.timestamps || ''] || 'off') },
+    { key: 'diarize', label: 'Diarize', type: 'select', options: ['off', 'on'], idx: existing.diarize ? 1 : 0 },
+  ];
+
+  const LABEL_W = 15; // right-align labels to this width
+  let active = 0;
+  let editing = false; // true when typing into a text/secret field
+  let inputBuf = '';
+
+  function renderForm() {
+    let out = `\x1b[H\x1b[2J`; // move home + clear screen
+    out += `\n${BOLD} dikt — setup${RESET}\n`;
+
+    // Contextual hint
+    const f = fields[active];
+    if (f.type === 'select') {
+      out += `  ${DIM}Tab/arrows to change, Enter to confirm${RESET}\n`;
+    } else if (editing) {
+      out += `  ${DIM}Type to ${f.type === 'secret' ? 'enter' : 'change'}, Enter to confirm${RESET}\n`;
+    } else {
+      out += `  ${DIM}Enter to keep default, or start typing to change${RESET}\n`;
+    }
+    out += '\n';
+
+    for (let i = 0; i < fields.length; i++) {
+      const fi = fields[i];
+      const label = fi.label.padStart(LABEL_W);
+      const isActive = i === active;
+      const marker = isActive ? `${GREEN}>${RESET}` : ' ';
+
+      if (fi.type === 'select') {
+        const parts = fi.options.map((opt, j) => {
+          if (isActive) {
+            return j === fi.idx ? `${BOLD}${GREEN}${opt}${RESET}` : `${DIM}${opt}${RESET}`;
+          }
+          return j === fi.idx ? opt : `${DIM}${opt}${RESET}`;
+        });
+        out += `${marker} ${isActive ? BOLD : DIM}${label}${RESET}  ${parts.join('   ')}\n`;
+      } else {
+        let valueStr;
+        if (isActive && editing) {
+          valueStr = fi.type === 'secret'
+            ? `${GREEN}${'•'.repeat(inputBuf.length)}${RESET}█`
+            : `${GREEN}${inputBuf}${RESET}█`;
+        } else if (isActive && !editing) {
+          valueStr = `${DIM}${fi.display}${RESET}`;
+        } else {
+          // Show confirmed value or default
+          const show = fi.value || fi.display;
+          valueStr = fi.value
+            ? (fi.type === 'secret' ? '••••' + fi.value.slice(-4) : fi.value)
+            : `${DIM}${show}${RESET}`;
+        }
+        out += `${marker} ${isActive ? BOLD : DIM}${label}${RESET}  ${valueStr}\n`;
+      }
+    }
+
+    process.stderr.write(out);
+  }
+
   return new Promise((resolve) => {
-    process.stderr.write(prompt);
     const { stdin } = process;
     stdin.setRawMode(true);
     stdin.resume();
     stdin.setEncoding('utf8');
 
-    let secret = '';
+    renderForm();
 
-    const cleanup = () => {
-      stdin.removeListener('data', onData);
-      stdin.setRawMode(false);
-      stdin.pause();
-    };
+    function advance() {
+      const f = fields[active];
+      // Commit text/secret field value
+      if (f.type !== 'select') {
+        if (inputBuf.trim()) {
+          f.value = inputBuf.trim();
+        } else {
+          f.value = f.fallback;
+        }
+        // Validate API key
+        if (f.key === 'apiKey' && !f.value) {
+          editing = false;
+          inputBuf = '';
+          renderForm();
+          process.stderr.write(`\n  ${RED}API key is required.${RESET}\n`);
+          return; // stay on this field
+        }
+        editing = false;
+        inputBuf = '';
+      }
+
+      active++;
+      if (active >= fields.length) {
+        // Save and exit
+        stdin.removeListener('data', onData);
+        stdin.setRawMode(false);
+        stdin.pause();
+
+        const ts = fields.find(f => f.key === 'timestamps');
+        const di = fields.find(f => f.key === 'diarize');
+        const tsValue = TIMESTAMPS_VALUE[ts.options[ts.idx]];
+        const diValue = di.options[di.idx] === 'on';
+
+        const lang = fields.find(f => f.key === 'language').value;
+        const tempVal = fields.find(f => f.key === 'temperature').value;
+
+        const cfg = {
+          apiKey: fields.find(f => f.key === 'apiKey').value,
+          model: fields.find(f => f.key === 'model').value,
+          language: lang === 'auto' ? '' : lang,
+          temperature: tempVal && tempVal !== 'default' ? parseFloat(tempVal) : null,
+          contextBias: fields.find(f => f.key === 'contextBias').value,
+          autoCopy: existing.autoCopy || false,
+          timestamps: tsValue,
+          diarize: diValue,
+        };
+        saveConfig(cfg);
+        process.stderr.write(`\n  ${GREEN}✓${RESET} Saved to ${DIM}${CONFIG_FILE}${RESET}\n\n`);
+        resolve(cfg);
+        return;
+      }
+      renderForm();
+    }
 
     const onData = (ch) => {
-      switch (ch) {
-        case '\n':
-        case '\r':
-        case '\u0004': // Ctrl+D
-          cleanup();
-          process.stderr.write('\n');
-          resolve(secret);
-          break;
-        case '\u0003': // Ctrl+C
-          cleanup();
-          process.stderr.write('\n');
-          process.exit(EXIT_CONFIG);
-          break;
-        case '\u007F': // Backspace (macOS)
-        case '\b':     // Backspace
-          if (secret.length > 0) {
-            secret = secret.slice(0, -1);
-            process.stderr.write('\b \b');
+      const f = fields[active];
+
+      // Ctrl+C — exit
+      if (ch === '\u0003') {
+        stdin.removeListener('data', onData);
+        stdin.setRawMode(false);
+        stdin.pause();
+        process.stderr.write('\n');
+        process.exit(EXIT_CONFIG);
+      }
+
+      if (f.type === 'select') {
+        if (ch === '\t' || ch === '\x1b[C' || ch === '\x1b[B') { // Tab, Right, Down
+          f.idx = (f.idx + 1) % f.options.length;
+          renderForm();
+        } else if (ch === '\x1b[D' || ch === '\x1b[A') { // Left, Up
+          f.idx = (f.idx - 1 + f.options.length) % f.options.length;
+          renderForm();
+        } else if (ch === '\n' || ch === '\r') {
+          advance();
+        }
+      } else {
+        // text / secret field
+        if (ch === '\n' || ch === '\r') {
+          advance();
+        } else if (ch === '\u007F' || ch === '\b') { // Backspace
+          if (inputBuf.length > 0) {
+            inputBuf = inputBuf.slice(0, -1);
+            if (!inputBuf) editing = false;
+            renderForm();
           }
-          break;
-        default:
-          if (ch.charCodeAt(0) >= 32) {
-            secret += ch;
-            process.stderr.write('*'.repeat(ch.length));
-          }
-          break;
+        } else if (ch.charCodeAt(0) >= 32 && !ch.startsWith('\x1b')) {
+          if (!editing) editing = true;
+          inputBuf += ch;
+          renderForm();
+        }
       }
     };
 
     stdin.on('data', onData);
   });
-}
-
-// ── Setup wizard ──────────────────────────────────────────────────────────────
-
-async function setupWizard() {
-  const existing = loadConfig() || {};
-
-  process.stderr.write(`\n${BOLD} dikt — setup${RESET}\n`);
-  process.stderr.write(`  ${DIM}Press Enter to keep the default shown in brackets.${RESET}\n\n`);
-
-  const apiKey = (await readSecret(`  Mistral API key [${existing.apiKey ? '••••' + existing.apiKey.slice(-4) : ''}]: `)).trim()
-    || existing.apiKey || '';
-  if (!apiKey) {
-    process.stderr.write(`\n  ${RED}API key is required.${RESET}\n\n`);
-    process.exit(EXIT_CONFIG);
-  }
-
-  const rl = readline.createInterface({ input: process.stdin, output: process.stderr });
-  const ask = (q) => new Promise((res) => rl.question(q, res));
-
-  const model = (await ask(`  Model [${existing.model || 'voxtral-mini-latest'}]: `)).trim()
-    || existing.model || 'voxtral-mini-latest';
-  const language = (await ask(`  Language [${existing.language || 'auto'}]: `)).trim()
-    || existing.language || '';
-  const tempStr = (await ask(`  Temperature [${existing.temperature ?? 'default'}]: `)).trim();
-  const temperature = tempStr ? parseFloat(tempStr) : (existing.temperature ?? null);
-  const contextBias = (await ask(`  Context bias [${existing.contextBias || ''}]: `)).trim()
-    || existing.contextBias || '';
-
-  rl.close();
-
-  const cfg = { apiKey, model, language: language === 'auto' ? '' : language, temperature, contextBias, autoCopy: existing.autoCopy || false };
-  saveConfig(cfg);
-  process.stderr.write(`\n  ${GREEN}✓${RESET} Saved to ${DIM}${CONFIG_FILE}${RESET}\n\n`);
-  return cfg;
 }
 
 // ── Prerequisites ─────────────────────────────────────────────────────────────
@@ -236,8 +332,13 @@ function getTermWidth() {
 function render() {
   const w = getTermWidth();
   const header = ` dikt`;
-  const right = `[?] [q]uit `;
-  const pad = Math.max(0, w - header.length - right.length);
+  const tags = [];
+  if (config.diarize) tags.push('diarize');
+  if (config.timestamps) tags.push('timestamps');
+  const tagStr = tags.length ? `  ${DIM}${tags.join(' · ')}${RESET}` : '';
+  const tagPlain = tags.length ? `  ${tags.join(' · ')}` : '';
+  const right = `[s]etup [?] [q]uit `;
+  const pad = Math.max(0, w - header.length - tagPlain.length - right.length);
 
   let out = moveTo(1);
 
@@ -251,7 +352,7 @@ function render() {
     out += CLEAR_LINE + '\n';
     out += renderHelp();
   } else {
-    out += CLEAR_LINE + BOLD + header + ' '.repeat(pad) + DIM + right + RESET + '\n';
+    out += CLEAR_LINE + BOLD + header + RESET + tagStr + ' '.repeat(pad) + DIM + right + RESET + '\n';
     out += CLEAR_LINE + ` ${'─'.repeat(Math.max(0, w - 2))}` + '\n';
     out += CLEAR_LINE + '\n';
     out += CLEAR_LINE + renderKeybar() + '\n';
@@ -328,6 +429,46 @@ function wrapTranscript(termWidth) {
   if (!text) return [];
   const indent = '   ';
   const maxLen = termWidth - indent.length - 1; // leave 1 col margin
+
+  // Diarized transcript: each line is already formatted with speaker labels + ANSI colors.
+  // Handle each speaker line independently — no quotes, just indent and wrap.
+  if (config.diarize && text.includes('\n')) {
+    const result = [];
+    for (const speakerLine of text.split('\n')) {
+      if (!speakerLine) continue;
+      // ANSI codes mess up length calculation — strip them for measuring
+      const plain = speakerLine.replace(/\x1b\[[0-9;]*m/g, '');
+      if (plain.length <= maxLen || maxLen < 10) {
+        result.push(`${indent}${speakerLine}`);
+      } else {
+        // Wrap long speaker lines: first line keeps the label, continuation lines get extra indent
+        const labelMatch = plain.match(/^([A-Z]\s{2})/);
+        const contIndent = labelMatch ? ' '.repeat(labelMatch[1].length) : '';
+        const words = speakerLine.split(/(\s+)/);
+        let cur = '';
+        let curPlain = '';
+        let first = true;
+        for (const word of words) {
+          const wordPlain = word.replace(/\x1b\[[0-9;]*m/g, '');
+          if (curPlain.length + wordPlain.length > maxLen && curPlain.length > 0) {
+            result.push(`${indent}${cur}`);
+            cur = first ? contIndent : '';
+            curPlain = first ? contIndent : '';
+            first = false;
+            const trimmed = word.replace(/^\s+/, '');
+            cur += trimmed;
+            curPlain += trimmed.replace(/\x1b\[[0-9;]*m/g, '');
+          } else {
+            cur += word;
+            curPlain += wordPlain;
+          }
+        }
+        if (cur) result.push(`${indent}${first ? '' : contIndent}${cur}`);
+      }
+    }
+    return result;
+  }
+
   if (maxLen < 10) return [`${indent}${text}`];
 
   const words = text.split(/(\s+)/);
@@ -566,60 +707,40 @@ async function transcribe(wavPath) {
   try {
     const blob = await fs.openAsBlob(wavPath, { type: 'audio/wav' });
     const file = new File([blob], 'recording.wav', { type: 'audio/wav' });
-    const fd = new FormData();
-    fd.append('file', file);
-    fd.append('model', config.model);
-    if (config.language) fd.append('language', config.language);
-    if (config.temperature != null) fd.append('temperature', String(config.temperature));
-    if (config.contextBias) fd.append('context_bias', config.contextBias);
 
     const t0 = Date.now();
-    const resp = await fetch('https://api.mistral.ai/v1/audio/transcriptions', {
-      method: 'POST',
-      headers: { Authorization: `Bearer ${config.apiKey}` },
-      body: fd,
+    const result = await callTranscribeAPI(file, {
       signal: AbortSignal.timeout(30_000),
+      timestamps: config.timestamps || '',
+      diarize: config.diarize || false,
     });
     state.latency = Date.now() - t0;
 
-    if (!resp.ok) {
-      const raw = await resp.text().catch(() => '');
-      let msg;
-      try {
-        const e = JSON.parse(raw);
-        msg = e.message;
-        if (!msg && Array.isArray(e.detail)) {
-          msg = e.detail.map(d => [d.loc?.join('.'), d.msg].filter(Boolean).join(': ')).join('; ');
-        } else if (!msg && e.detail) {
-          msg = typeof e.detail === 'string' ? e.detail : JSON.stringify(e.detail);
-        }
-        if (!msg) msg = raw;
-      } catch {
-        msg = raw || `HTTP ${resp.status}`;
-      }
-      if (resp.status === 401) msg += ' — press [s] to reconfigure';
-      throw new Error(msg);
-    }
-
-    const data = await resp.json();
-    const text = (data.text || '').trim();
+    const text = result.text;
 
     if (!text) {
       state.mode = 'error';
       state.error = 'No speech detected';
     } else {
-      state.transcript = text;
+      // Format with speaker labels if diarization is active
+      if (config.diarize && result.segments) {
+        state.transcript = formatDiarizedText(result.segments, { color: true });
+      } else {
+        state.transcript = text;
+      }
       state.wordCount = text.split(/\s+/).filter(Boolean).length;
       state.mode = 'ready';
 
       // Push to history
-      state.history.unshift({ transcript: text, wordCount: state.wordCount, duration: state.duration, latency: state.latency });
+      state.history.unshift({ transcript: state.transcript, wordCount: state.wordCount, duration: state.duration, latency: state.latency });
       if (state.history.length > MAX_HISTORY) state.history.pop();
       state.historyIndex = -1;
     }
   } catch (err) {
     state.mode = 'error';
-    state.error = err.name === 'TimeoutError' ? 'Transcription timed out' : err.message;
+    let msg = err.name === 'TimeoutError' ? 'Transcription timed out' : err.message;
+    if (err.status === 401) msg += ' — press [s] to reconfigure';
+    state.error = msg;
   } finally {
     clearInterval(state.spinnerInterval);
     cleanupRecFile();
@@ -779,17 +900,63 @@ function peakAmplitude(chunk) {
   return peak;
 }
 
-async function transcribeBuffer(rawChunks, signal) {
-  const rawData = Buffer.concat(rawChunks);
-  const wavData = Buffer.concat([createWavHeader(rawData.length), rawData]);
-  const blob = new Blob([wavData], { type: 'audio/wav' });
-  const file = new File([blob], 'recording.wav', { type: 'audio/wav' });
+function trimSilence(rawData) {
+  const SAMPLE_RATE = 16000;
+  const BYTES_PER_SAMPLE = 2;
+  const WINDOW_SAMPLES = Math.round(SAMPLE_RATE * 0.05); // 50ms windows
+  const WINDOW_BYTES = WINDOW_SAMPLES * BYTES_PER_SAMPLE;
+  const MAX_SILENCE_WINDOWS = Math.round(1.0 / 0.05); // 1 second = 20 windows
+  const PAD_WINDOWS = Math.round(0.1 / 0.05); // 100ms padding = 2 windows
+
+  const windows = [];
+  for (let offset = 0; offset + WINDOW_BYTES <= rawData.length; offset += WINDOW_BYTES) {
+    windows.push(rawData.subarray(offset, offset + WINDOW_BYTES));
+  }
+  // Include any trailing partial window
+  const remainder = rawData.length % WINDOW_BYTES;
+  if (remainder > 0) {
+    windows.push(rawData.subarray(rawData.length - remainder));
+  }
+
+  const output = [];
+  let silentCount = 0;
+
+  for (const win of windows) {
+    const peak = peakAmplitude(win);
+    if (peak < SILENCE_THRESHOLD) {
+      silentCount++;
+      if (silentCount <= MAX_SILENCE_WINDOWS) {
+        output.push(win);
+      } else if (silentCount === MAX_SILENCE_WINDOWS + 1) {
+        // Replace excess silence with padding
+        const padBytes = PAD_WINDOWS * WINDOW_BYTES;
+        output.push(Buffer.alloc(padBytes)); // zeros = silence
+      }
+      // else: skip (already added padding)
+    } else {
+      silentCount = 0;
+      output.push(win);
+    }
+  }
+
+  return Buffer.concat(output);
+}
+
+async function callTranscribeAPI(file, { signal, timestamps, diarize } = {}) {
   const fd = new FormData();
   fd.append('file', file);
   fd.append('model', config.model);
   if (config.language) fd.append('language', config.language);
   if (config.temperature != null) fd.append('temperature', String(config.temperature));
   if (config.contextBias) fd.append('context_bias', config.contextBias);
+  if (timestamps) {
+    for (const g of timestamps.split(',')) fd.append('timestamp_granularities[]', g.trim());
+  }
+  if (diarize) {
+    fd.append('diarize', 'true');
+    // API requires segment timestamps when diarize is enabled
+    if (!timestamps) fd.append('timestamp_granularities[]', 'segment');
+  }
 
   const t0 = Date.now();
   const resp = await fetch('https://api.mistral.ai/v1/audio/transcriptions', {
@@ -802,12 +969,126 @@ async function transcribeBuffer(rawChunks, signal) {
 
   if (!resp.ok) {
     const raw = await resp.text().catch(() => '');
-    throw new Error(raw || `HTTP ${resp.status}`);
+    let msg;
+    try {
+      const e = JSON.parse(raw);
+      msg = e.message;
+      if (typeof msg === 'object' && msg !== null) msg = JSON.stringify(msg);
+      if (!msg && Array.isArray(e.detail)) {
+        msg = e.detail.map(d => [d.loc?.join('.'), d.msg].filter(Boolean).join(': ')).join('; ');
+      } else if (!msg && e.detail) {
+        msg = typeof e.detail === 'string' ? e.detail : JSON.stringify(e.detail);
+      }
+      if (!msg) msg = raw;
+    } catch {
+      msg = raw || `HTTP ${resp.status}`;
+    }
+    const err = new Error(msg);
+    err.status = resp.status;
+    throw err;
   }
 
   const data = await resp.json();
   const text = (data.text || '').trim();
-  return { text, latency };
+  return { text, latency, segments: data.segments, words: data.words };
+}
+
+async function transcribeBuffer(rawChunks, { signal, timestamps, diarize } = {}) {
+  const rawData = Buffer.concat(rawChunks);
+  const trimmed = trimSilence(rawData);
+  const wavData = Buffer.concat([createWavHeader(trimmed.length), trimmed]);
+  const blob = new Blob([wavData], { type: 'audio/wav' });
+  const file = new File([blob], 'recording.wav', { type: 'audio/wav' });
+  return callTranscribeAPI(file, { signal, timestamps, diarize });
+}
+
+// ── Output formatting helpers ─────────────────────────────────────────────────
+
+const SPEAKER_COLORS = [GREEN, YELLOW, CYAN, MAGENTA, BLUE, RED];
+
+function formatDiarizedText(segments, { color = false } = {}) {
+  if (!segments || !segments.length) return '';
+
+  // Map speaker IDs to short letters (A, B, C, ...)
+  const speakerMap = new Map();
+  for (const s of segments) {
+    if (s.speaker_id != null && !speakerMap.has(s.speaker_id)) {
+      speakerMap.set(s.speaker_id, speakerMap.size);
+    }
+  }
+
+  // Merge consecutive segments from the same speaker
+  const merged = [];
+  for (const s of segments) {
+    const text = (s.text || '').trim();
+    if (!text) continue;
+    const last = merged[merged.length - 1];
+    if (last && last.speaker_id === s.speaker_id) {
+      last.text += ' ' + text;
+    } else {
+      merged.push({ speaker_id: s.speaker_id, text });
+    }
+  }
+
+  return merged.map(s => {
+    const idx = speakerMap.get(s.speaker_id) ?? 0;
+    const letter = String.fromCharCode(65 + idx); // A, B, C, ...
+    if (color) {
+      const c = SPEAKER_COLORS[idx % SPEAKER_COLORS.length];
+      return `${c}${BOLD}${letter}${RESET}  ${s.text}`;
+    }
+    return `${letter}  ${s.text}`;
+  }).join('\n');
+}
+
+function buildJsonOutput(base, { segments, words, timestamps, diarize } = {}) {
+  const out = { ...base, timestamp: new Date().toISOString() };
+  if ((timestamps || diarize) && segments) out.segments = segments;
+  if (timestamps && words) out.words = words;
+  return out;
+}
+
+// ── File mode ────────────────────────────────────────────────────────────────
+
+async function runFile(flags) {
+  try {
+    if (!flags.file || !fs.existsSync(flags.file)) {
+      process.stderr.write(`Error: file not found: ${flags.file}\n`);
+      return EXIT_TRANSCRIPTION;
+    }
+
+    const blob = await fs.openAsBlob(flags.file);
+    const ext = path.extname(flags.file).slice(1) || 'wav';
+    const mimeTypes = { wav: 'audio/wav', mp3: 'audio/mpeg', m4a: 'audio/mp4', ogg: 'audio/ogg', flac: 'audio/flac', webm: 'audio/webm' };
+    const mime = mimeTypes[ext] || 'audio/wav';
+    const file = new File([blob], path.basename(flags.file), { type: mime });
+
+    const result = await callTranscribeAPI(file, { timestamps: flags.timestamps, diarize: flags.diarize });
+
+    if (!result.text) {
+      process.stderr.write('No speech detected\n');
+      return EXIT_TRANSCRIPTION;
+    }
+
+    const wordCount = result.text.split(/\s+/).filter(Boolean).length;
+
+    if (flags.json) {
+      const out = buildJsonOutput(
+        { text: result.text, latency: result.latency, words: wordCount },
+        { segments: result.segments, words: result.words, timestamps: flags.timestamps, diarize: flags.diarize },
+      );
+      process.stdout.write(JSON.stringify(out) + '\n');
+    } else if (flags.diarize && result.segments) {
+      process.stdout.write(formatDiarizedText(result.segments) + '\n');
+    } else {
+      process.stdout.write(result.text + '\n');
+    }
+
+    return EXIT_OK;
+  } catch (err) {
+    process.stderr.write(`Error: ${err.message}\n`);
+    return EXIT_TRANSCRIPTION;
+  }
 }
 
 // ── Single-shot mode ──────────────────────────────────────────────────────────
@@ -840,7 +1121,7 @@ async function runOnce(flags) {
     });
 
     const silenceTimer = setInterval(() => {
-      if (heardSound && Date.now() - lastSoundTime > flags.silence * 1000) {
+      if (flags.silence > 0 && heardSound && Date.now() - lastSoundTime > flags.silence * 1000) {
         recProc.kill('SIGTERM');
       }
     }, 100);
@@ -860,20 +1141,26 @@ async function runOnce(flags) {
     const abortHandler = () => ac.abort();
     process.on('SIGINT', abortHandler);
 
-    const { text, latency } = await transcribeBuffer(chunks, ac.signal);
+    const result = await transcribeBuffer(chunks, { signal: ac.signal, timestamps: flags.timestamps, diarize: flags.diarize });
     process.removeListener('SIGINT', abortHandler);
 
-    if (!text) {
+    if (!result.text) {
       process.stderr.write('No speech detected\n');
       return EXIT_TRANSCRIPTION;
     }
 
-    const wordCount = text.split(/\s+/).filter(Boolean).length;
+    const wordCount = result.text.split(/\s+/).filter(Boolean).length;
 
     if (flags.json) {
-      process.stdout.write(JSON.stringify({ text, duration: parseFloat(duration.toFixed(1)), latency, words: wordCount }) + '\n');
+      const out = buildJsonOutput(
+        { text: result.text, duration: parseFloat(duration.toFixed(1)), latency: result.latency, words: wordCount },
+        { segments: result.segments, words: result.words, timestamps: flags.timestamps, diarize: flags.diarize },
+      );
+      process.stdout.write(JSON.stringify(out) + '\n');
+    } else if (flags.diarize && result.segments) {
+      process.stdout.write(formatDiarizedText(result.segments) + '\n');
     } else {
-      process.stdout.write(text + '\n');
+      process.stdout.write(result.text + '\n');
     }
 
     return EXIT_OK;
@@ -900,7 +1187,7 @@ async function runStream(flags) {
     recProc.stderr.on('data', () => {});
 
     let killed = false;
-    const killRec = () => { if (!killed) { killed = true; recProc.kill('SIGTERM'); } };
+    const killRec = () => { if (!killed) { killed = true; recProc.kill('SIGTERM'); process.stderr.write('\n'); } };
     process.on('SIGINT', killRec);
 
     let chunks = [];          // current chunk buffer (resets per pause)
@@ -932,14 +1219,21 @@ async function runStream(flags) {
         chunkHasAudio = false;
         chunkStart = Date.now();
 
-        const p = transcribeBuffer(batch)
-          .then(({ text, latency }) => {
-            if (!text) return;
-            const wordCount = text.split(/\s+/).filter(Boolean).length;
+        const p = transcribeBuffer(batch, { timestamps: flags.timestamps, diarize: flags.diarize })
+          .then((result) => {
+            if (!result.text) return;
+            const wordCount = result.text.split(/\s+/).filter(Boolean).length;
             if (flags.json) {
-              process.stdout.write(JSON.stringify({ text, chunk: idx, duration: parseFloat(duration.toFixed(1)), latency, words: wordCount }) + '\n');
+              const out = buildJsonOutput(
+                { text: result.text, chunk: idx, duration: parseFloat(duration.toFixed(1)), latency: result.latency, words: wordCount },
+                { segments: result.segments, words: result.words, timestamps: flags.timestamps, diarize: flags.diarize },
+              );
+              process.stdout.write(JSON.stringify(out) + '\n');
+            } else if (flags.diarize && result.segments) {
+              const sep = flags.noNewline ? ' ' : '\n';
+              process.stdout.write(formatDiarizedText(result.segments) + sep);
             } else {
-              process.stdout.write(text + '\n');
+              process.stdout.write(result.text + (flags.noNewline ? ' ' : '\n'));
             }
           })
           .catch((err) => {
@@ -949,7 +1243,7 @@ async function runStream(flags) {
       }
 
       // Stop: full silence threshold reached
-      if (heardSound && silenceMs > flags.silence * 1000) {
+      if (flags.silence > 0 && heardSound && silenceMs > flags.silence * 1000) {
         killRec();
       }
     }, 100);
@@ -963,13 +1257,20 @@ async function runStream(flags) {
       const duration = (Date.now() - chunkStart) / 1000;
       const idx = chunkIndex++;
       try {
-        const { text, latency } = await transcribeBuffer(chunks);
-        if (text) {
-          const wordCount = text.split(/\s+/).filter(Boolean).length;
+        const result = await transcribeBuffer(chunks, { timestamps: flags.timestamps, diarize: flags.diarize });
+        if (result.text) {
+          const wordCount = result.text.split(/\s+/).filter(Boolean).length;
           if (flags.json) {
-            process.stdout.write(JSON.stringify({ text, chunk: idx, duration: parseFloat(duration.toFixed(1)), latency, words: wordCount }) + '\n');
+            const out = buildJsonOutput(
+              { text: result.text, chunk: idx, duration: parseFloat(duration.toFixed(1)), latency: result.latency, words: wordCount },
+              { segments: result.segments, words: result.words, timestamps: flags.timestamps, diarize: flags.diarize },
+            );
+            process.stdout.write(JSON.stringify(out) + '\n');
+          } else if (flags.diarize && result.segments) {
+            const sep = flags.noNewline ? ' ' : '\n';
+            process.stdout.write(formatDiarizedText(result.segments) + sep);
           } else {
-            process.stdout.write(text + '\n');
+            process.stdout.write(result.text + (flags.noNewline ? ' ' : '\n'));
           }
         }
       } catch (err) {
@@ -979,6 +1280,9 @@ async function runStream(flags) {
 
     // Wait for any in-flight transcriptions to finish
     await Promise.allSettled(pending);
+
+    // Final newline for --no-newline so shell prompt starts on a new line
+    if (flags.noNewline && !flags.json) process.stdout.write('\n');
 
     return EXIT_OK;
   } catch (err) {
@@ -1015,9 +1319,13 @@ async function main() {
     noInput: args.includes('--no-input'),
     setup: args.includes('--setup') || args[0] === 'setup',
     stream: args.includes('--stream'),
-    silence: args.includes('--silence') ? parseFloat(args[args.indexOf('--silence') + 1]) || 2.0 : 2.0,
+    silence: args.includes('--silence') ? (Number.isFinite(parseFloat(args[args.indexOf('--silence') + 1])) ? parseFloat(args[args.indexOf('--silence') + 1]) : 2.0) : 2.0,
     pause: args.includes('--pause') ? parseFloat(args[args.indexOf('--pause') + 1]) || 1.0 : 1.0,
     language: args.includes('--language') ? args[args.indexOf('--language') + 1] || '' : '',
+    file: args.includes('--file') ? args[args.indexOf('--file') + 1] || '' : '',
+    noNewline: args.includes('--no-newline') || args.includes('-n'),
+    timestamps: args.includes('--timestamps') ? args[args.indexOf('--timestamps') + 1] || '' : '',
+    diarize: args.includes('--diarize'),
   };
 
   if (args.includes('--version')) {
@@ -1059,9 +1367,13 @@ Options:
   --json                     Record once, output JSON to stdout
   -q, --quiet                Record once, print transcript to stdout
   --stream                   Stream transcription chunks on pauses
+  --file <path>              Transcribe an audio file (no mic needed)
   --silence <seconds>        Silence duration before auto-stop (default: 2.0)
   --pause <seconds>          Pause duration to split chunks (default: 1.0)
   --language <code>          Language code, e.g. en, de, fr (default: auto)
+  -n, --no-newline           Join stream chunks without newlines
+  --timestamps <granularity> Add timestamps: segment, word, or segment,word
+  --diarize                  Enable speaker identification
   --no-input                 Fail if config is missing (no wizard)
   --no-color                 Disable colored output
   --version                  Show version
@@ -1084,6 +1396,10 @@ Examples:
   dikt --stream --json       Stream chunks as JSON Lines
   dikt -q | claude           Dictate a prompt to Claude Code
   dikt update                Update to the latest version
+  dikt --file meeting.wav    Transcribe an existing audio file
+  dikt --stream --silence 0  Stream continuously until Ctrl+C
+  dikt --stream -n           Stream as continuous flowing text
+  dikt -q --json --diarize   Transcribe with speaker labels
 
 Environment variables:
   DIKT_API_KEY               Override API key from config
@@ -1104,8 +1420,6 @@ Requires: sox (brew install sox)`);
     process.exit(EXIT_OK);
   }
 
-  checkSox();
-
   // Load or setup config
   if (flags.setup) {
     checkTTY();
@@ -1124,6 +1438,8 @@ Requires: sox (brew install sox)`);
 
   applyEnvOverrides(config);
   if (flags.language) config.language = flags.language;
+  if (!flags.timestamps && config.timestamps) flags.timestamps = config.timestamps;
+  if (!flags.diarize && config.diarize) flags.diarize = true;
 
   const validation = validateConfig(config);
   if (!validation.valid) {
@@ -1132,6 +1448,28 @@ Requires: sox (brew install sox)`);
     }
     process.exit(EXIT_CONFIG);
   }
+
+  // Validate incompatible flag combinations
+  const lang = config.language;
+  if (lang && flags.timestamps) {
+    process.stderr.write('Error: --timestamps and --language cannot be used together\n');
+    process.exit(EXIT_CONFIG);
+  }
+  if (lang && flags.diarize) {
+    process.stderr.write('Error: --diarize and --language cannot be used together\n');
+    process.exit(EXIT_CONFIG);
+  }
+  if (flags.diarize && flags.stream) {
+    process.stderr.write('Error: --diarize is not compatible with --stream, use -q --diarize instead\n');
+    process.exit(EXIT_CONFIG);
+  }
+
+  // File mode: transcribe an existing audio file (no sox needed)
+  if (flags.file) {
+    process.exit(await runFile(flags));
+  }
+
+  checkSox();
 
   // Stream mode: chunked transcription on pauses
   if (flags.stream) {
@@ -1145,6 +1483,10 @@ Requires: sox (brew install sox)`);
 
   // Interactive TUI mode
   checkTTY();
+
+  // Clear any setup wizard output before entering alt screen, so it doesn't
+  // leak back when the alt screen exits.
+  process.stdout.write(CLEAR_SCREEN);
 
   // Enter raw TUI mode (alternate screen buffer prevents scrollback corruption)
   process.stdout.write(ALT_SCREEN_ON + HIDE_CURSOR + CLEAR_SCREEN);
