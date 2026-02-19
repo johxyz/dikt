@@ -1403,6 +1403,32 @@ async function main() {
     output: flagVal(args, '--output', 'path') || flagVal(args, '-o', 'path'),
   };
 
+  // Reject unknown flags and arguments
+  const knownFlags = new Set([
+    '--json', '--quiet', '-q', '--no-input', '--setup', '--stream',
+    '--no-newline', '-n', '--diarize', '--version', '--update',
+    '--help', '-h', '--no-color',
+    '--silence', '--pause', '--language', '--file', '--timestamps',
+    '--output', '-o',
+  ]);
+  const knownCommands = new Set(['setup', 'update']);
+  const valueTakers = new Set(['--silence', '--pause', '--language', '--file', '--timestamps', '--output', '-o']);
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    if (a.startsWith('-')) {
+      if (!knownFlags.has(a)) {
+        process.stderr.write(`Unknown flag: ${a}\nRun dikt --help for usage.\n`);
+        process.exit(EXIT_CONFIG);
+      }
+      if (valueTakers.has(a)) i++; // skip value
+    } else if (knownCommands.has(a)) {
+      // ok — subcommand
+    } else {
+      process.stderr.write(`Unexpected argument: ${a}\nRun dikt --help for usage.\n`);
+      process.exit(EXIT_CONFIG);
+    }
+  }
+
   if (args.includes('--version')) {
     console.log(`dikt v${VERSION}`);
     process.exit(EXIT_OK);
