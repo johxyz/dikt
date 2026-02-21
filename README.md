@@ -23,6 +23,11 @@ sudo apt install sox
 sudo pacman -S sox
 ```
 
+Optional dependencies for `--file` mode:
+
+- [ffmpeg](https://ffmpeg.org/) — enables compression, chunked transcription of long files, and broader format support
+- [yt-dlp](https://github.com/yt-dlp/yt-dlp) — enables transcribing audio from URLs (YouTube, podcasts, etc.)
+
 ## Setup
 
 On first run, dikt will prompt you for your Mistral API key and model preferences:
@@ -90,7 +95,7 @@ dikt --stream --silence 0
 
 ### File mode
 
-Transcribe an existing audio file (wav, mp3, m4a, flac, ogg, webm — no sox needed):
+Transcribe an existing audio file (wav, mp3, m4a, flac, ogg, webm, aac, wma, and more):
 
 ```bash
 dikt --file meeting.wav
@@ -101,6 +106,10 @@ dikt --file meeting.wav -o transcript.txt
 
 # With JSON output
 dikt --file recording.mp3 --json
+
+# Transcribe from a URL (requires yt-dlp)
+dikt --file https://youtube.com/watch?v=VIDEO_ID
+dikt --file https://youtube.com/watch?v=VIDEO_ID -o transcript.txt
 ```
 
 ### Speaker identification & timestamps
@@ -112,7 +121,7 @@ dikt -q --diarize
 # Timestamps
 dikt -q --timestamps segment
 dikt -q --timestamps word
-dikt -q --timestamps segment,word
+dikt --file lecture.mp3 --timestamps segment
 
 # Combined with JSON
 dikt -q --json --diarize
@@ -122,7 +131,7 @@ dikt -q --json --diarize
 
 | Flag | Description |
 |---|---|
-| `--file <path>` | Transcribe an audio file (no mic needed) |
+| `--file <path\|url>` | Transcribe audio file or URL (via yt-dlp) |
 | `-o`, `--output <path>` | Write output to file (`.json` auto-enables JSON) |
 | `--stream` | Stream transcription chunks on pauses |
 | `--json` | Output JSON (single-shot or stream) |
@@ -130,7 +139,7 @@ dikt -q --json --diarize
 | `--silence <seconds>` | Silence duration before auto-stop (default: 2.0) |
 | `--pause <seconds>` | Pause duration to split stream chunks (default: 1.0) |
 | `--language <code>` | Language code, e.g. en, de, fr (default: auto) |
-| `--timestamps <granularity>` | Add timestamps: segment, word, or segment,word |
+| `--timestamps <granularity>` | Add timestamps: segment or word |
 | `--diarize` | Enable speaker identification |
 | `-n`, `--no-newline` | Join stream chunks without newlines |
 | `--no-color` | Disable colored output |

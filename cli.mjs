@@ -6,7 +6,10 @@ import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import readline from 'node:readline';
-import { spawn, execFileSync } from 'node:child_process';
+import { spawn, execFileSync, execFile as execFileCb } from 'node:child_process';
+import { promisify } from 'node:util';
+const execFileAsync = promisify(execFileCb);
+import https from 'node:https';
 
 // ── ANSI helpers ──────────────────────────────────────────────────────────────
 
@@ -37,9 +40,16 @@ if (process.env.NO_COLOR != null || process.env.TERM === 'dumb' || process.argv.
 
 const moveTo = (row, col = 1) => `${ESC}${row};${col}H`;
 
+function formatFileSize(bytes) {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  if (bytes < 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+  return `${(bytes / (1024 * 1024 * 1024)).toFixed(1)} GB`;
+}
+
 // ── Constants ─────────────────────────────────────────────────────────────────
 
-const VERSION = '1.2.0';
+const VERSION = '1.3.0';
 const CONFIG_BASE = process.env.XDG_CONFIG_HOME || path.join(os.homedir(), '.config');
 const CONFIG_DIR = path.join(CONFIG_BASE, 'dikt');
 const CONFIG_FILE = path.join(CONFIG_DIR, 'config.json');
@@ -47,6 +57,56 @@ const MAX_HISTORY = 10;
 const MIN_RECORDING_MS = 500;
 const COST_PER_MIN = 0.003;
 const SPINNER = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+const TARGET_CHUNK_SEC = 270;    // ~4.5 min target chunk size
+const CHUNK_MIN_SEC = 360;       // only chunk files longer than 6 minutes
+const SPLIT_SEARCH_SEC = 30;     // search ±30s around target for silence split point
+const MIN_CHUNK_SEC = 30;        // merge chunks shorter than this into neighbor
+const MAX_PARALLEL = 4;          // max concurrent API requests
+const MIME_TYPES = { wav: 'audio/wav', mp3: 'audio/mpeg', ogg: 'audio/ogg', flac: 'audio/flac', opus: 'audio/ogg', webm: 'audio/webm', m4a: 'audio/mp4', aac: 'audio/aac', wma: 'audio/x-ms-wma', aif: 'audio/aiff', aiff: 'audio/aiff', mp4: 'audio/mp4', oga: 'audio/ogg', amr: 'audio/amr', caf: 'audio/x-caf' };
+const COMPRESSIBLE = new Set(['wav', 'flac', 'aiff', 'aif', 'raw', 'caf']); // lossless formats worth re-encoding
+
+function createStderrSpinner() {
+  let frame = 0;
+  let interval = null;
+  let currentMsg = '';
+  const isTTY = process.stderr.isTTY;
+  const render = () => {
+    const sp = SPINNER[frame++ % SPINNER.length];
+    process.stderr.write(`\r${CLEAR_LINE}${YELLOW}${sp}${RESET} ${currentMsg}`);
+  };
+
+  return {
+    start(msg) {
+      currentMsg = msg;
+      if (isTTY) {
+        render();
+        interval = setInterval(render, 80);
+      } else {
+        process.stderr.write(`${currentMsg}\n`);
+      }
+    },
+    update(msg) {
+      currentMsg = msg;
+      if (isTTY) {
+        // Restart interval — prevents queued callbacks from firing after sync calls
+        if (interval) { clearInterval(interval); }
+        render();
+        interval = setInterval(render, 80);
+      } else {
+        process.stderr.write(`${msg}\n`);
+      }
+    },
+    stop(finalMsg) {
+      if (interval) { clearInterval(interval); interval = null; }
+      if (isTTY) {
+        process.stderr.write(`\r${CLEAR_LINE}`);
+        if (finalMsg) process.stderr.write(`${finalMsg}\n`);
+      } else if (finalMsg) {
+        process.stderr.write(`${finalMsg}\n`);
+      }
+    },
+  };
+}
 
 const EXIT_OK = 0;
 const EXIT_DEPENDENCY = 1;
@@ -93,8 +153,8 @@ function validateConfig(cfg) {
 
 // ── Setup wizard (form-based) ─────────────────────────────────────────────────
 
-const TIMESTAMPS_DISPLAY = { '': 'off', 'segment': 'segment', 'word': 'word', 'segment,word': 'both' };
-const TIMESTAMPS_VALUE = { 'off': '', 'segment': 'segment', 'word': 'word', 'both': 'segment,word' };
+const TIMESTAMPS_DISPLAY = { '': 'off', 'segment': 'segment', 'word': 'word' };
+const TIMESTAMPS_VALUE = { 'off': '', 'segment': 'segment', 'word': 'word' };
 
 async function setupWizard() {
   const existing = loadConfig() || {};
@@ -105,7 +165,7 @@ async function setupWizard() {
     { key: 'language', label: 'Language', type: 'text', value: '', display: existing.language || 'auto', fallback: existing.language || '' },
     { key: 'temperature', label: 'Temperature', type: 'text', value: '', display: existing.temperature != null ? String(existing.temperature) : 'default', fallback: existing.temperature != null ? String(existing.temperature) : '' },
     { key: 'contextBias', label: 'Context bias', type: 'text', value: '', display: existing.contextBias || '', fallback: existing.contextBias || '' },
-    { key: 'timestamps', label: 'Timestamps', type: 'select', options: ['off', 'segment', 'word', 'both'], idx: ['off', 'segment', 'word', 'both'].indexOf(TIMESTAMPS_DISPLAY[existing.timestamps || ''] || 'off') },
+    { key: 'timestamps', label: 'Timestamps', type: 'select', options: ['off', 'segment', 'word'], idx: ['off', 'segment', 'word'].indexOf(TIMESTAMPS_DISPLAY[existing.timestamps || ''] || 'off') },
     { key: 'diarize', label: 'Diarize', type: 'select', options: ['off', 'on'], idx: existing.diarize ? 1 : 0 },
   ];
 
@@ -953,7 +1013,7 @@ function trimSilence(rawData) {
   return Buffer.concat(output);
 }
 
-async function callTranscribeAPI(file, { signal, timestamps, diarize } = {}) {
+async function callTranscribeAPI(file, { signal, timestamps, diarize, onProgress } = {}) {
   const fd = new FormData();
   fd.append('file', file);
   fd.append('model', config.model);
@@ -961,7 +1021,7 @@ async function callTranscribeAPI(file, { signal, timestamps, diarize } = {}) {
   if (config.temperature != null) fd.append('temperature', String(config.temperature));
   if (config.contextBias) fd.append('context_bias', config.contextBias);
   if (timestamps) {
-    for (const g of timestamps.split(',')) fd.append('timestamp_granularities[]', g.trim());
+    fd.append('timestamp_granularities[]', timestamps);
   }
   if (diarize) {
     fd.append('diarize', 'true');
@@ -969,17 +1029,68 @@ async function callTranscribeAPI(file, { signal, timestamps, diarize } = {}) {
     if (!timestamps) fd.append('timestamp_granularities[]', 'segment');
   }
 
-  const t0 = Date.now();
-  const resp = await fetch('https://api.mistral.ai/v1/audio/transcriptions', {
+  // Use Request to serialize FormData into multipart body,
+  // then send via node:https which has no hardcoded headersTimeout
+  // (Node's built-in fetch/undici has a 300s headersTimeout that
+  // cannot be configured without importing undici as a dependency).
+  const req = new Request('https://api.mistral.ai/v1/audio/transcriptions', {
     method: 'POST',
     headers: { Authorization: `Bearer ${config.apiKey}` },
     body: fd,
-    signal: signal || AbortSignal.timeout(30_000),
+  });
+  const contentType = req.headers.get('content-type');
+  const body = Buffer.from(await req.arrayBuffer());
+
+  const t0 = Date.now();
+  const { status, raw } = await new Promise((resolve, reject) => {
+    const hreq = https.request('https://api.mistral.ai/v1/audio/transcriptions', {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${config.apiKey}`,
+        'Content-Type': contentType,
+        'Content-Length': body.length,
+      },
+    }, (res) => {
+      const chunks = [];
+      res.on('data', (c) => chunks.push(c));
+      res.on('end', () => resolve({ status: res.statusCode, raw: Buffer.concat(chunks).toString() }));
+      res.on('error', reject);
+    });
+
+    hreq.on('error', (err) => {
+      const ne = new Error(`Network error: ${err.message}`);
+      ne.networkError = true;
+      reject(ne);
+    });
+
+    const abortSig = signal || AbortSignal.timeout(30_000);
+    if (abortSig.aborted) { hreq.destroy(); reject(new DOMException('The operation was aborted', 'AbortError')); return; }
+    abortSig.addEventListener('abort', () => {
+      hreq.destroy();
+      reject(abortSig.reason instanceof DOMException ? abortSig.reason
+        : new DOMException('The operation was aborted', 'AbortError'));
+    }, { once: true });
+
+    // Write body in chunks to enable upload progress tracking
+    const CHUNK_SIZE = 256 * 1024;
+    let written = 0;
+    const total = body.length;
+    const writeChunks = () => {
+      while (written < total) {
+        const end = Math.min(written + CHUNK_SIZE, total);
+        const ok = hreq.write(body.subarray(written, end));
+        written = end;
+        if (onProgress) onProgress(written, total);
+        if (!ok) { hreq.once('drain', writeChunks); return; }
+      }
+      if (onProgress) onProgress(-1, total); // upload done, server processing
+      hreq.end();
+    };
+    writeChunks();
   });
   const latency = Date.now() - t0;
 
-  if (!resp.ok) {
-    const raw = await resp.text().catch(() => '');
+  if (status < 200 || status >= 300) {
     let msg;
     try {
       const e = JSON.parse(raw);
@@ -992,14 +1103,14 @@ async function callTranscribeAPI(file, { signal, timestamps, diarize } = {}) {
       }
       if (!msg) msg = raw;
     } catch {
-      msg = raw || `HTTP ${resp.status}`;
+      msg = raw || `HTTP ${status}`;
     }
     const err = new Error(msg);
-    err.status = resp.status;
+    err.status = status;
     throw err;
   }
 
-  const data = await resp.json();
+  const data = JSON.parse(raw);
   const text = (data.text || '').trim();
   return { text, latency, segments: data.segments, words: data.words };
 }
@@ -1059,27 +1170,296 @@ function buildJsonOutput(base, { segments, words, timestamps, diarize } = {}) {
   return out;
 }
 
+// ── File optimization helpers ────────────────────────────────────────────────
+
+let _ffmpegAvail;
+function ffmpegAvailable() {
+  if (_ffmpegAvail !== undefined) return _ffmpegAvail;
+  try {
+    execFileSync('ffmpeg', ['-version'], { stdio: 'pipe' });
+    execFileSync('ffprobe', ['-version'], { stdio: 'pipe' });
+    _ffmpegAvail = true;
+  } catch { _ffmpegAvail = false; }
+  return _ffmpegAvail;
+}
+
+let _ytdlpAvail;
+function ytdlpAvailable() {
+  if (_ytdlpAvail !== undefined) return _ytdlpAvail;
+  try { execFileSync('yt-dlp', ['--version'], { stdio: 'pipe' }); _ytdlpAvail = true; }
+  catch { _ytdlpAvail = false; }
+  return _ytdlpAvail;
+}
+
+function downloadWithYtdlp(url, spinner) {
+  const tmpBase = path.join(os.tmpdir(), `dikt-ytdlp-${process.pid}-${Date.now()}`);
+  const outTemplate = `${tmpBase}.%(ext)s`;
+
+  return new Promise((resolve, reject) => {
+    const proc = spawn('yt-dlp', [
+      '-x', '--audio-format', 'opus', '--audio-quality', '48K',
+      '-o', outTemplate, '--no-playlist', '--newline', url,
+    ], { stdio: ['ignore', 'pipe', 'pipe'] });
+
+    const cleanupPartial = () => {
+      const dir = path.dirname(tmpBase);
+      const prefix = path.basename(tmpBase);
+      try {
+        for (const f of fs.readdirSync(dir)) {
+          if (f.startsWith(prefix) && f.length > prefix.length) try { fs.unlinkSync(path.join(dir, f)); } catch {}
+        }
+      } catch {}
+    };
+
+    let aborted = false;
+    const onSigint = () => { aborted = true; proc.kill(); };
+    process.on('SIGINT', onSigint);
+
+    let lastErr = '';
+    const parseOutput = (chunk) => {
+      const lines = chunk.toString().split('\n');
+      for (const line of lines) {
+        if (!line.trim()) continue;
+        const dl = line.match(/\[download\]\s+([\d.]+)%/);
+        if (dl) { spinner.update(`Downloading... ${Math.round(parseFloat(dl[1]))}%`); continue; }
+        if (/\[ExtractAudio\]/.test(line)) { spinner.update('Converting audio...'); continue; }
+        if (/\[download\]\s+Destination:/.test(line)) { spinner.update('Downloading...'); continue; }
+      }
+    };
+    proc.stdout.on('data', parseOutput);
+    proc.stderr.on('data', (chunk) => {
+      lastErr = chunk.toString().trim().split('\n').pop();
+      parseOutput(chunk);
+    });
+
+    proc.on('close', (code) => {
+      process.removeListener('SIGINT', onSigint);
+      if (aborted) { cleanupPartial(); return reject(new Error('Download aborted')); }
+      if (code !== 0) { cleanupPartial(); return reject(new Error(lastErr || `yt-dlp exited with code ${code}`)); }
+      // yt-dlp may produce a different extension than requested; find the actual file
+      const dir = path.dirname(tmpBase);
+      const prefix = path.basename(tmpBase);
+      try {
+        const match = fs.readdirSync(dir).find(f => f.startsWith(prefix) && f.length > prefix.length);
+        if (!match) return reject(new Error('yt-dlp produced no output file'));
+        resolve(path.join(dir, match));
+      } catch (err) { reject(err); }
+    });
+  });
+}
+
+function getAudioDuration(filePath) {
+  try {
+    const out = execFileSync('ffprobe', ['-v', 'quiet', '-show_entries', 'format=duration', '-of', 'csv=p=0', filePath], { stdio: 'pipe', encoding: 'utf8' });
+    return parseFloat(out.trim()) || 0;
+  } catch { return 0; }
+}
+
+async function compressAudio(inputPath) {
+  const base = path.join(os.tmpdir(), `dikt-${process.pid}-${Date.now()}-${path.basename(inputPath, path.extname(inputPath))}`);
+  for (const codec of ['libopus', 'libvorbis']) {
+    const outPath = `${base}.ogg`;
+    try {
+      await execFileAsync('ffmpeg', ['-i', inputPath, '-c:a', codec, '-b:a', '48k', '-y', '-v', 'quiet', outPath], { stdio: 'pipe' });
+      if (fs.statSync(outPath).size > 0) return outPath;
+      try { fs.unlinkSync(outPath); } catch {}
+    } catch { try { fs.unlinkSync(outPath); } catch {} }
+  }
+  return null;
+}
+
+async function findSilenceSplitPoint(filePath, targetSec) {
+  const startSec = Math.max(0, targetSec - SPLIT_SEARCH_SEC);
+  const durSec = SPLIT_SEARCH_SEC * 2;
+
+  try {
+    // Extract a small window of raw PCM around the target for silence analysis
+    const { stdout: raw } = await execFileAsync('ffmpeg', [
+      '-ss', String(startSec), '-t', String(durSec), '-i', filePath,
+      '-f', 's16le', '-ar', '16000', '-ac', '1', '-v', 'quiet', '-',
+    ], { encoding: 'buffer', maxBuffer: 16000 * 2 * durSec + 4096 });
+
+    // Scan for silence in 50ms windows
+    const WINDOW_BYTES = Math.round(16000 * 0.05) * 2; // 50ms at 16kHz 16-bit mono
+    let bestOffset = -1, bestLen = 0;
+    let runStart = -1, runLen = 0;
+
+    for (let offset = 0; offset + WINDOW_BYTES <= raw.length; offset += WINDOW_BYTES) {
+      const peak = peakAmplitude(raw.subarray(offset, offset + WINDOW_BYTES));
+      if (peak < SILENCE_THRESHOLD) {
+        if (runStart === -1) runStart = offset;
+        runLen++;
+      } else {
+        if (runLen > bestLen) { bestOffset = runStart; bestLen = runLen; }
+        runStart = -1; runLen = 0;
+      }
+    }
+    if (runLen > bestLen) { bestOffset = runStart; bestLen = runLen; }
+
+    if (bestLen >= 10) { // at least 500ms of silence (avoids mid-word splits)
+      const centerBytes = bestOffset + Math.floor(bestLen / 2) * WINDOW_BYTES;
+      return startSec + centerBytes / (16000 * 2);
+    }
+  } catch {}
+
+  return targetSec; // fallback: no silence found, split at target
+}
+
+function cleanChunkText(t) {
+  if (!t) return '';
+  // Strip [PRINT_WORDLEVEL_TIME] markup the API sometimes spontaneously returns
+  if (t.includes('[PRINT_WORDLEVEL_TIME]')) {
+    t = t.replace(/\[PRINT_WORDLEVEL_TIME\]/g, '');
+    t = t.replace(/<\/?\d{2}:\d{2}\.\d+>/g, '');
+    t = t.replace(/\s+/g, ' ');
+  }
+  return t.trim();
+}
+
+function mergeChunkResults(results, splitPoints) {
+  // No overlap — just concatenate text, offset timestamps
+  let text = results.map(r => cleanChunkText(r.text)).filter(Boolean).join(' ');
+  // Fix missing spaces after punctuation (API omits leading spaces on some segments)
+  text = text.replace(/([.!?,])([A-Za-z])/g, '$1 $2');
+  let maxLatency = 0;
+  const allSegments = [];
+  const allWords = [];
+
+  const round1 = (n) => Math.round(n * 10) / 10;
+  for (let i = 0; i < results.length; i++) {
+    const r = results[i];
+    const offset = splitPoints[i];
+    if (r.latency > maxLatency) maxLatency = r.latency;
+
+    if (r.segments) {
+      for (const seg of r.segments) {
+        allSegments.push({ ...seg, start: round1(seg.start + offset), end: round1(seg.end + offset) });
+      }
+    }
+    if (r.words) {
+      for (const w of r.words) {
+        allWords.push({ ...w, start: round1(w.start + offset), end: round1(w.end + offset) });
+      }
+    }
+  }
+
+  return {
+    text,
+    latency: maxLatency,
+    segments: allSegments.length ? allSegments : undefined,
+    words: allWords.length ? allWords : undefined,
+  };
+}
+
+async function parallelMap(items, fn, concurrency) {
+  const results = new Array(items.length);
+  let next = 0;
+  const worker = async () => { while (next < items.length) { const i = next++; results[i] = await fn(items[i], i); } };
+  await Promise.all(Array.from({ length: Math.min(concurrency, items.length) }, () => worker()));
+  return results;
+}
+
 // ── File mode ────────────────────────────────────────────────────────────────
 
 async function runFile(flags) {
+  const spinner = createStderrSpinner();
+  let fileSize = 0;
+  let transcribeTimer = null;
+  const tempFiles = [];
+
   try {
-    if (!flags.file || !fs.existsSync(flags.file)) {
+    const isURL = /^https?:\/\//i.test(flags.file);
+
+    if (isURL) {
+      if (!ytdlpAvailable()) {
+        process.stderr.write(`\n${RED}${BOLD}  yt-dlp not found.${RESET}\n\n`);
+        process.stderr.write(`  yt-dlp is required to download audio from URLs. Install it:\n\n`);
+        if (process.platform === 'darwin') {
+          process.stderr.write(`    ${BOLD}brew install yt-dlp${RESET}\n\n`);
+        } else if (process.platform === 'win32') {
+          process.stderr.write(`    ${BOLD}choco install yt-dlp${RESET}  or  ${BOLD}scoop install yt-dlp${RESET}\n\n`);
+        } else {
+          process.stderr.write(`    ${BOLD}sudo apt install yt-dlp${RESET}  (Debian/Ubuntu)\n`);
+          process.stderr.write(`    ${BOLD}pip install yt-dlp${RESET}      (any platform)\n\n`);
+        }
+        return EXIT_DEPENDENCY;
+      }
+      spinner.start('Downloading audio...');
+      try {
+        const downloaded = await downloadWithYtdlp(flags.file, spinner);
+        tempFiles.push(downloaded);
+        flags = { ...flags, file: downloaded };
+      } catch (err) {
+        spinner.stop();
+        process.stderr.write(`Error downloading: ${err.message}\n`);
+        return EXIT_TRANSCRIPTION;
+      }
+      spinner.update('Processing audio...');
+    } else if (!flags.file || !fs.existsSync(flags.file)) {
       process.stderr.write(`Error: file not found: ${flags.file}\n`);
       return EXIT_TRANSCRIPTION;
+    } else {
+      spinner.start('Reading file...');
+    }
+    fileSize = fs.statSync(flags.file).size;
+    const ext = path.extname(flags.file).slice(1).toLowerCase() || 'wav';
+
+    // Check if ffmpeg is available for chunking / compression optimizations
+    const hasFFmpeg = ffmpegAvailable();
+    const duration = hasFFmpeg ? getAudioDuration(flags.file) : 0;
+    const canChunk = hasFFmpeg && !flags.diarize && duration > CHUNK_MIN_SEC;
+
+    if (canChunk) {
+      spinner.stop();
+      return await runFileChunked(flags, { fileSize, duration });
     }
 
-    const blob = await fs.openAsBlob(flags.file);
-    const ext = path.extname(flags.file).slice(1) || 'wav';
-    const mimeTypes = { wav: 'audio/wav', mp3: 'audio/mpeg', m4a: 'audio/mp4', ogg: 'audio/ogg', flac: 'audio/flac', webm: 'audio/webm' };
-    const mime = mimeTypes[ext] || 'audio/wav';
-    const file = new File([blob], path.basename(flags.file), { type: mime });
+    // Compress uncompressed formats (wav/flac → ogg) for faster upload
+    let uploadPath = flags.file;
+    let uploadExt = ext;
+    if (hasFFmpeg && COMPRESSIBLE.has(ext)) {
+      spinner.update('Compressing...');
+      const compressed = await compressAudio(flags.file);
+      if (compressed) {
+        const newSize = fs.statSync(compressed).size;
+        if (newSize < fileSize) {
+          tempFiles.push(compressed);
+          uploadPath = compressed;
+          uploadExt = path.extname(compressed).slice(1);
+          spinner.update(`Compressed ${formatFileSize(fileSize)} → ${formatFileSize(newSize)}`);
+        } else {
+          try { fs.unlinkSync(compressed); } catch {}
+        }
+      }
+    }
+
+    const blob = await fs.openAsBlob(uploadPath);
+    const mime = MIME_TYPES[uploadExt] || 'application/octet-stream';
+    const file = new File([blob], path.basename(uploadPath), { type: mime });
+
+    spinner.update(`Uploading to API... (${formatFileSize(blob.size)})`);
 
     const ac = new AbortController();
-    const abortHandler = () => ac.abort();
+    const abortHandler = () => { spinner.stop('Aborting...'); ac.abort(); };
     process.on('SIGINT', abortHandler);
 
-    const result = await callTranscribeAPI(file, { signal: ac.signal, timestamps: flags.timestamps, diarize: flags.diarize });
+    const onProgress = (sent, total) => {
+      if (sent === -1) {
+        const t0 = Date.now();
+        const elapsed = () => { const s = Math.floor((Date.now() - t0) / 1000); return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`; };
+        spinner.update(`Transcribing... ${DIM}(${elapsed()})${RESET}`);
+        transcribeTimer = setInterval(() => spinner.update(`Transcribing... ${DIM}(${elapsed()})${RESET}`), 1000);
+      } else {
+        const pct = Math.round((sent / total) * 100);
+        spinner.update(`Uploading ${pct}% (${formatFileSize(sent)} / ${formatFileSize(total)})`);
+      }
+    };
+
+    const result = await callTranscribeAPI(file, { signal: ac.signal, timestamps: flags.timestamps, diarize: flags.diarize, onProgress });
+    if (transcribeTimer) clearInterval(transcribeTimer);
     process.removeListener('SIGINT', abortHandler);
+
+    spinner.stop(`${GREEN}Done${RESET} (${(result.latency / 1000).toFixed(1)}s)`);
 
     if (!result.text) {
       process.stderr.write('No speech detected\n');
@@ -1110,12 +1490,180 @@ async function runFile(flags) {
 
     return EXIT_OK;
   } catch (err) {
+    if (transcribeTimer) clearInterval(transcribeTimer);
+    spinner.stop();
+
     if (err.name === 'AbortError') {
       process.stderr.write('Aborted\n');
       return EXIT_TRANSCRIPTION;
     }
-    process.stderr.write(`Error: ${err.message}\n`);
+
+    const parts = [`Error: ${err.message}`];
+    if (fileSize) parts.push(`  File: ${flags.file} (${formatFileSize(fileSize)})`);
+
+    if (err.networkError) {
+      parts.push('  Hint: check your network connection and try again');
+    } else if (err.status === 401) {
+      parts.push('  Hint: invalid API key — run `dikt setup` to reconfigure');
+    } else if (err.status === 413) {
+      parts.push('  Hint: file is too large for the API — try a shorter recording');
+    } else if (err.status === 429) {
+      parts.push('  Hint: rate limited — wait a moment and try again');
+    } else if (err.status >= 500) {
+      parts.push('  Hint: Mistral API server error — try again later');
+    }
+
+    process.stderr.write(parts.join('\n') + '\n');
     return EXIT_TRANSCRIPTION;
+  } finally {
+    for (const f of tempFiles) { try { fs.unlinkSync(f); } catch {} }
+  }
+}
+
+async function runFileChunked(flags, { fileSize, duration }) {
+  const spinner = createStderrSpinner();
+  const tempFiles = [];
+  const t0 = Date.now();
+  let progressTimer = null;
+  let abortHandler = null;
+
+  try {
+    // Find optimal split points at silence boundaries
+    const numTargetChunks = Math.ceil(duration / TARGET_CHUNK_SEC);
+    spinner.start('Analyzing audio for split points...');
+
+    const splitPoints = [0];
+    for (let i = 1; i < numTargetChunks; i++) {
+      spinner.update(`Finding split point ${i}/${numTargetChunks - 1}...`);
+      splitPoints.push(await findSilenceSplitPoint(flags.file, i * TARGET_CHUNK_SEC));
+    }
+    splitPoints.push(duration);
+
+    // Merge tiny trailing chunks (< MIN_CHUNK_SEC) into the previous one
+    for (let i = splitPoints.length - 2; i > 0; i--) {
+      if (splitPoints[i + 1] - splitPoints[i] < MIN_CHUNK_SEC) {
+        splitPoints.splice(i, 1);
+      }
+    }
+
+    const numChunks = splitPoints.length - 1;
+
+    // Split audio and compress each chunk
+    const chunkBase = path.join(os.tmpdir(), `dikt-${process.pid}-${Date.now()}`);
+    const uploadPaths = [];
+
+    for (let i = 0; i < numChunks; i++) {
+      spinner.update(`Preparing chunk ${i + 1}/${numChunks}...`);
+      const start = splitPoints[i];
+      const dur = splitPoints[i + 1] - start;
+      const oggPath = `${chunkBase}-${i}.ogg`;
+      try {
+        await execFileAsync('ffmpeg', ['-ss', String(start), '-t', String(dur), '-i', flags.file, '-c:a', 'libopus', '-b:a', '48k', '-y', '-v', 'quiet', oggPath], { stdio: 'pipe' });
+        if (fs.statSync(oggPath).size > 0) {
+          tempFiles.push(oggPath);
+          uploadPaths.push(oggPath);
+        } else { throw new Error('empty output'); }
+      } catch {
+        try { fs.unlinkSync(oggPath); } catch {}
+        const wavPath = `${chunkBase}-${i}.wav`;
+        await execFileAsync('ffmpeg', ['-ss', String(start), '-t', String(dur), '-i', flags.file, '-y', '-v', 'quiet', wavPath], { stdio: 'pipe' });
+        if (!fs.statSync(wavPath).size) throw new Error(`ffmpeg produced empty chunk ${i}`);
+        tempFiles.push(wavPath);
+        uploadPaths.push(wavPath);
+      }
+    }
+
+    const totalUploadSize = uploadPaths.reduce((sum, p) => sum + fs.statSync(p).size, 0);
+    spinner.update(`Compressed → ${formatFileSize(totalUploadSize)} total`);
+
+    // Abort handling
+    const ac = new AbortController();
+    abortHandler = () => { spinner.stop('Aborting...'); ac.abort(); };
+    process.on('SIGINT', abortHandler);
+
+    // Transcribe chunks in parallel
+    let completed = 0;
+    const elapsed = () => {
+      const s = Math.floor((Date.now() - t0) / 1000);
+      return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`;
+    };
+    spinner.update(`Transcribing ${numChunks} chunks... ${DIM}(${elapsed()})${RESET}`);
+    progressTimer = setInterval(() => {
+      spinner.update(`Transcribing... ${completed}/${numChunks} done ${DIM}(${elapsed()})${RESET}`);
+    }, 1000);
+
+    const chunkIndices = Array.from({ length: numChunks }, (_, i) => i);
+    const results = await parallelMap(chunkIndices, async (i) => {
+      const uploadPath = uploadPaths[i];
+      const ext = path.extname(uploadPath).slice(1);
+      const blob = await fs.openAsBlob(uploadPath);
+      const file = new File([blob], `chunk-${i}.${ext}`, { type: MIME_TYPES[ext] || 'audio/wav' });
+      const result = await callTranscribeAPI(file, { signal: ac.signal, timestamps: flags.timestamps });
+      completed++;
+      return result;
+    }, MAX_PARALLEL);
+
+    clearInterval(progressTimer); progressTimer = null;
+    process.removeListener('SIGINT', abortHandler); abortHandler = null;
+
+    // Merge results — no overlap, just concatenate text and offset timestamps
+    const merged = mergeChunkResults(results, splitPoints);
+    const totalLatency = Date.now() - t0;
+    spinner.stop(`${GREEN}Done${RESET} (${(totalLatency / 1000).toFixed(1)}s, ${numChunks} chunks)`);
+
+    if (!merged.text) {
+      process.stderr.write('No speech detected\n');
+      return EXIT_TRANSCRIPTION;
+    }
+
+    const wordCount = merged.text.split(/\s+/).filter(Boolean).length;
+
+    let output;
+    if (flags.json) {
+      const out = buildJsonOutput(
+        { text: merged.text, latency: totalLatency, words: wordCount },
+        { segments: merged.segments, words: merged.words, timestamps: flags.timestamps, diarize: false },
+      );
+      output = JSON.stringify(out, null, flags.output ? 2 : 0) + '\n';
+    } else {
+      output = merged.text + '\n';
+    }
+
+    if (flags.output) {
+      fs.writeFileSync(flags.output, output);
+      process.stderr.write(`Saved to ${flags.output}\n`);
+    } else {
+      process.stdout.write(output);
+    }
+
+    return EXIT_OK;
+  } catch (err) {
+    spinner.stop();
+
+    if (err.name === 'AbortError') {
+      process.stderr.write('Aborted\n');
+      return EXIT_TRANSCRIPTION;
+    }
+
+    const parts = [`Error: ${err.message}`];
+    if (fileSize) parts.push(`  File: ${flags.file} (${formatFileSize(fileSize)})`);
+
+    if (err.networkError) {
+      parts.push('  Hint: check your network connection and try again');
+    } else if (err.status === 401) {
+      parts.push('  Hint: invalid API key — run `dikt setup` to reconfigure');
+    } else if (err.status === 429) {
+      parts.push('  Hint: rate limited — wait a moment and try again');
+    } else if (err.status >= 500) {
+      parts.push('  Hint: Mistral API server error — try again later');
+    }
+
+    process.stderr.write(parts.join('\n') + '\n');
+    return EXIT_TRANSCRIPTION;
+  } finally {
+    if (progressTimer) clearInterval(progressTimer);
+    if (abortHandler) process.removeListener('SIGINT', abortHandler);
+    for (const f of tempFiles) { try { fs.unlinkSync(f); } catch {} }
   }
 }
 
@@ -1398,7 +1946,7 @@ async function main() {
     language: flagVal(args, '--language', 'e.g. en, de, fr'),
     file: flagVal(args, '--file', 'path to audio file'),
     noNewline: args.includes('--no-newline') || args.includes('-n'),
-    timestamps: flagVal(args, '--timestamps', 'segment, word, or segment,word', { valid: ['segment', 'word', 'segment,word'] }),
+    timestamps: flagVal(args, '--timestamps', 'segment or word', { valid: ['segment', 'word'] }),
     diarize: args.includes('--diarize'),
     output: flagVal(args, '--output', 'path') || flagVal(args, '-o', 'path'),
   };
@@ -1468,13 +2016,13 @@ Options:
   --json                     Record once, output JSON to stdout
   -q, --quiet                Record once, print transcript to stdout
   --stream                   Stream transcription chunks on pauses
-  --file <path>              Transcribe an audio file (no mic needed)
+  --file <path|url>          Transcribe audio file or URL (via yt-dlp)
   -o, --output <path>        Write output to file (.json auto-enables JSON)
   --silence <seconds>        Silence duration before auto-stop (default: 2.0)
   --pause <seconds>          Pause duration to split chunks (default: 1.0)
   --language <code>          Language code, e.g. en, de, fr (default: auto)
   -n, --no-newline           Join stream chunks without newlines
-  --timestamps <granularity> Add timestamps: segment, word, or segment,word
+  --timestamps <granularity> Add timestamps: segment or word
   --diarize                  Enable speaker identification
   --no-input                 Fail if config is missing (no wizard)
   --no-color                 Disable colored output
@@ -1501,6 +2049,7 @@ Examples:
   dikt --file meeting.wav    Transcribe an existing audio file
   dikt --file a.wav -o a.json  Transcribe to a JSON file
   dikt --file a.wav -o a.txt   Transcribe to a text file
+  dikt --file https://youtube.com/watch?v=ID  Transcribe from URL
   dikt --stream --silence 0  Stream continuously until Ctrl+C
   dikt --stream -n           Stream as continuous flowing text
   dikt -q --json --diarize   Transcribe with speaker labels
@@ -1514,13 +2063,13 @@ Environment variables:
 
 Exit codes:
   0  Success
-  1  Missing dependency (sox)
+  1  Missing dependency (sox/ffmpeg)
   2  Not a terminal
   3  Configuration error
   4  Transcription error
 
 Config: ${CONFIG_DIR}/config.json
-Requires: sox (brew install sox)`);
+Requires: sox (recording), ffmpeg (--file optimization), yt-dlp (URLs, optional)`);
     process.exit(EXIT_OK);
   }
 
@@ -1542,7 +2091,10 @@ Requires: sox (brew install sox)`);
 
   applyEnvOverrides(config);
   if (flags.language) config.language = flags.language;
-  if (!flags.timestamps && config.timestamps) flags.timestamps = config.timestamps;
+  if (!flags.timestamps && config.timestamps) {
+    // Migrate legacy 'segment,word' → 'word' (combined option removed)
+    flags.timestamps = config.timestamps === 'segment,word' ? 'word' : config.timestamps;
+  }
   if (!flags.diarize && config.diarize) flags.diarize = true;
   if (flags.output && flags.output.endsWith('.json')) flags.json = true;
 
