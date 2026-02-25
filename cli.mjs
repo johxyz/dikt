@@ -49,7 +49,7 @@ function formatFileSize(bytes) {
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
-const VERSION = '1.3.0';
+const VERSION = '1.4.0';
 const CONFIG_BASE = process.env.XDG_CONFIG_HOME || path.join(os.homedir(), '.config');
 const CONFIG_DIR = path.join(CONFIG_BASE, 'dikt');
 const CONFIG_FILE = path.join(CONFIG_DIR, 'config.json');
