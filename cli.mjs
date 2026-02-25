@@ -49,7 +49,7 @@ function formatFileSize(bytes) {
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
-const VERSION = '1.4.0';
+const VERSION = '1.4.1';
 const CONFIG_BASE = process.env.XDG_CONFIG_HOME || path.join(os.homedir(), '.config');
 const CONFIG_DIR = path.join(CONFIG_BASE, 'dikt');
 const CONFIG_FILE = path.join(CONFIG_DIR, 'config.json');
@@ -786,22 +786,32 @@ async function transcribe(wavPath) {
     const file = new File([blob], 'recording.wav', { type: 'audio/wav' });
 
     const t0 = Date.now();
-    const result = await callTranscribeAPI(file, {
-      signal: AbortSignal.timeout(30_000),
-      timestamps: config.timestamps || '',
-      diarize: config.diarize || false,
-    });
-    state.latency = Date.now() - t0;
 
-    const text = result.text;
+    // For long recordings, chunk and transcribe in parallel (if ffmpeg available)
+    const canChunk = ffmpegAvailable() && !config.diarize && state.duration > CHUNK_MIN_SEC;
+    let text, segments;
+
+    if (canChunk) {
+      const chunkResult = await transcribeChunkedWav(wavPath, state.duration);
+      text = chunkResult.text;
+      segments = chunkResult.segments;
+    } else {
+      const result = await callTranscribeAPI(file, {
+        timestamps: config.timestamps || '',
+        diarize: config.diarize || false,
+      });
+      text = result.text;
+      segments = result.segments;
+    }
+    state.latency = Date.now() - t0;
 
     if (!text) {
       state.mode = 'error';
       state.error = 'No speech detected';
     } else {
       // Format with speaker labels if diarization is active
-      if (config.diarize && result.segments) {
-        state.transcript = formatDiarizedText(result.segments, { color: true });
+      if (config.diarize && segments) {
+        state.transcript = formatDiarizedText(segments, { color: true });
       } else {
         state.transcript = text;
       }
@@ -815,7 +825,7 @@ async function transcribe(wavPath) {
     }
   } catch (err) {
     state.mode = 'error';
-    let msg = err.name === 'TimeoutError' ? 'Transcription timed out' : err.message;
+    let msg = err.message;
     if (err.status === 401) msg += ' — press [s] to reconfigure';
     state.error = msg;
   } finally {
@@ -823,6 +833,66 @@ async function transcribe(wavPath) {
     cleanupRecFile();
     if (config.autoCopy && state.mode === 'ready') copy(state.transcript);
     renderAll();
+  }
+}
+
+async function transcribeChunkedWav(wavPath, durationSec) {
+  const tempFiles = [];
+  try {
+    const numTargetChunks = Math.ceil(durationSec / TARGET_CHUNK_SEC);
+    const splitPoints = [0];
+    for (let i = 1; i < numTargetChunks; i++) {
+      splitPoints.push(await findSilenceSplitPoint(wavPath, i * TARGET_CHUNK_SEC));
+    }
+    splitPoints.push(durationSec);
+
+    // Merge tiny trailing chunks into the previous one
+    for (let i = splitPoints.length - 2; i > 0; i--) {
+      if (splitPoints[i + 1] - splitPoints[i] < MIN_CHUNK_SEC) {
+        splitPoints.splice(i, 1);
+      }
+    }
+
+    const numChunks = splitPoints.length - 1;
+    const chunkBase = path.join(os.tmpdir(), `dikt-${process.pid}-${Date.now()}`);
+    const uploadPaths = [];
+
+    for (let i = 0; i < numChunks; i++) {
+      const start = splitPoints[i];
+      const dur = splitPoints[i + 1] - start;
+      const oggPath = `${chunkBase}-${i}.ogg`;
+      try {
+        await execFileAsync('ffmpeg', ['-ss', String(start), '-t', String(dur), '-i', wavPath, '-c:a', 'libopus', '-b:a', '48k', '-y', '-v', 'quiet', oggPath], { stdio: 'pipe' });
+        if (fs.statSync(oggPath).size > 0) {
+          tempFiles.push(oggPath);
+          uploadPaths.push(oggPath);
+        } else { throw new Error('empty output'); }
+      } catch {
+        try { fs.unlinkSync(oggPath); } catch {}
+        const chunkWav = `${chunkBase}-${i}.wav`;
+        await execFileAsync('ffmpeg', ['-ss', String(start), '-t', String(dur), '-i', wavPath, '-y', '-v', 'quiet', chunkWav], { stdio: 'pipe' });
+        if (!fs.statSync(chunkWav).size) throw new Error(`ffmpeg produced empty chunk ${i}`);
+        tempFiles.push(chunkWav);
+        uploadPaths.push(chunkWav);
+      }
+    }
+
+    // Transcribe chunks in parallel
+    let completed = 0;
+    const chunkIndices = Array.from({ length: numChunks }, (_, i) => i);
+    const results = await parallelMap(chunkIndices, async (i) => {
+      const uploadPath = uploadPaths[i];
+      const ext = path.extname(uploadPath).slice(1);
+      const blob = await fs.openAsBlob(uploadPath);
+      const file = new File([blob], `chunk-${i}.${ext}`, { type: MIME_TYPES[ext] || 'audio/wav' });
+      const result = await callTranscribeAPI(file, { timestamps: config.timestamps || '' });
+      completed++;
+      return result;
+    }, MAX_PARALLEL);
+
+    return mergeChunkResults(results, splitPoints);
+  } finally {
+    for (const f of tempFiles) { try { fs.unlinkSync(f); } catch {} }
   }
 }
 
@@ -1072,13 +1142,14 @@ async function callTranscribeAPI(file, { signal, timestamps, diarize, onProgress
       reject(ne);
     });
 
-    const abortSig = signal || AbortSignal.timeout(30_000);
-    if (abortSig.aborted) { hreq.destroy(); reject(new DOMException('The operation was aborted', 'AbortError')); return; }
-    abortSig.addEventListener('abort', () => {
-      hreq.destroy();
-      reject(abortSig.reason instanceof DOMException ? abortSig.reason
-        : new DOMException('The operation was aborted', 'AbortError'));
-    }, { once: true });
+    if (signal) {
+      if (signal.aborted) { hreq.destroy(); reject(new DOMException('The operation was aborted', 'AbortError')); return; }
+      signal.addEventListener('abort', () => {
+        hreq.destroy();
+        reject(signal.reason instanceof DOMException ? signal.reason
+          : new DOMException('The operation was aborted', 'AbortError'));
+      }, { once: true });
+    }
 
     // Write body in chunks to enable upload progress tracking
     const CHUNK_SIZE = 256 * 1024;
