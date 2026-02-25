@@ -458,13 +458,22 @@ function renderKeybar() {
   return `   ${DIM}[SPACE]${RESET} Record  ${copyKey}${autoCopyKey}${histKey}${retryKey}`.trimEnd();
 }
 
+function formatDuration(seconds) {
+  if (seconds < 60) return `${seconds.toFixed(1)}s`;
+  const m = Math.floor(seconds / 60);
+  const s = (seconds % 60).toFixed(1).padStart(4, '0');
+  if (m < 60) return `${m}m ${s}s`;
+  const h = Math.floor(m / 60);
+  const rm = String(m % 60).padStart(2, '0');
+  return `${h}h ${rm}m ${s}s`;
+}
+
 function renderStatus() {
   switch (state.mode) {
     case 'idle':
       return `   ${GREY}● Idle${RESET}`;
     case 'recording': {
-      const secs = state.duration.toFixed(1);
-      return `   ${RED}${BOLD}● Recording${RESET} ${RED}${secs}s${RESET}`;
+      return `   ${RED}${BOLD}● Recording${RESET} ${RED}${formatDuration(state.duration)}${RESET}`;
     }
     case 'transcribing': {
       const sp = SPINNER[state.spinnerFrame % SPINNER.length];
@@ -558,7 +567,7 @@ function renderMeta() {
   const cost = (state.duration / 60 * COST_PER_MIN).toFixed(4);
   const latencyStr = state.latency ? `${(state.latency / 1000).toFixed(1)}s` : '—';
   const histLabel = state.historyIndex >= 0 ? ` · history ${state.historyIndex + 1}/${state.history.length}` : '';
-  return `   ${DIM}${state.wordCount} words · ${state.duration.toFixed(1)}s · latency ${latencyStr} · $${cost}${histLabel}${RESET}`;
+  return `   ${DIM}${state.wordCount} words · ${formatDuration(state.duration)} · latency ${latencyStr} · $${cost}${histLabel}${RESET}`;
 }
 
 function renderHelp() {
