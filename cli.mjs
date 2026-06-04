@@ -49,7 +49,7 @@ function formatFileSize(bytes) {
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
-const VERSION = '1.4.1';
+const VERSION = '1.5.0';
 const CONFIG_BASE = process.env.XDG_CONFIG_HOME || path.join(os.homedir(), '.config');
 const CONFIG_DIR = path.join(CONFIG_BASE, 'dikt');
 const CONFIG_FILE = path.join(CONFIG_DIR, 'config.json');
@@ -379,6 +379,12 @@ const state = {
   spinnerFrame: 0,
   copiedTimeout: null,
   lastCtrlC: 0,
+  // Batch jobs view (state.mode === 'jobs')
+  jobsList: [],          // batch records loaded from disk
+  jobsIndex: 0,          // selected row
+  jobsBusy: false,       // an async refresh/fetch is in flight
+  jobsMsg: '',           // transient status line under the list
+  jobsSpinner: null,     // interval animating the busy spinner
 };
 
 // ── TUI Rendering ─────────────────────────────────────────────────────────────
@@ -411,6 +417,8 @@ function render() {
     out += CLEAR_LINE + '\n';
     out += CLEAR_LINE + '\n';
     out += renderHelp();
+  } else if (state.mode === 'jobs') {
+    out += renderJobs(w);
   } else {
     out += CLEAR_LINE + BOLD + header + RESET + tagStr + ' '.repeat(pad) + DIM + right + RESET + '\n';
     out += CLEAR_LINE + ` ${'─'.repeat(Math.max(0, w - 2))}` + '\n';
@@ -421,7 +429,7 @@ function render() {
     out += CLEAR_LINE + '\n';
   }
 
-  if (state.mode !== 'help') {
+  if (state.mode !== 'help' && state.mode !== 'jobs') {
     if (state.mode === 'idle' && !state.transcript) {
       out += CLEAR_LINE + `   ${DIM}Press SPACE to start dictating.${RESET}` + '\n';
       out += CLEAR_LINE + `   ${DIM}Press ? for all keybindings.${RESET}` + '\n';
@@ -441,7 +449,7 @@ function render() {
     }
   }
 
-  if (state.mode !== 'help') out += CLEAR_LINE + renderMeta();
+  if (state.mode !== 'help' && state.mode !== 'jobs') out += CLEAR_LINE + renderMeta();
   out += CLEAR_DOWN;
 
   process.stdout.write(out);
@@ -455,7 +463,7 @@ function renderKeybar() {
   const autoCopyKey = config.autoCopy ? `${DIM}[a]${RESET} Auto-copy ✓  ` : `${DIM}[a]${RESET} Auto-copy  `;
   const histKey = state.history.length ? `${DIM}[h]${RESET} History  ` : '';
   const retryKey = state.recFile ? `${DIM}[r]${RESET} Retry  ` : '';
-  return `   ${DIM}[SPACE]${RESET} Record  ${copyKey}${autoCopyKey}${histKey}${retryKey}`.trimEnd();
+  return `   ${DIM}[SPACE]${RESET} Record  ${copyKey}${autoCopyKey}${histKey}${retryKey}${DIM}[b]${RESET} Jobs`.trimEnd();
 }
 
 function formatDuration(seconds) {
@@ -578,6 +586,7 @@ function renderHelp() {
   out += CLEAR_LINE + `   ${BOLD}c${RESET}  ${BOLD}Enter${RESET}   Copy transcript to clipboard` + '\n';
   out += CLEAR_LINE + `   ${BOLD}a${RESET}          Toggle auto-copy to clipboard` + '\n';
   out += CLEAR_LINE + `   ${BOLD}h${RESET}          Cycle through history` + '\n';
+  out += CLEAR_LINE + `   ${BOLD}b${RESET}          Batch jobs view` + '\n';
   out += CLEAR_LINE + `   ${BOLD}r${RESET}          Re-transcribe last recording` + '\n';
   out += CLEAR_LINE + `   ${BOLD}Esc${RESET}        Cancel current recording` + '\n';
   out += CLEAR_LINE + `   ${BOLD}s${RESET}          Re-run setup wizard` + '\n';
@@ -587,6 +596,59 @@ function renderHelp() {
   out += CLEAR_LINE + `   ${DIM}Press any key to return.${RESET}` + '\n';
   return out;
 }
+
+function renderJobs(termWidth) {
+  let out = '';
+  out += CLEAR_LINE + `   ${BOLD}Batch jobs${RESET}` + '\n';
+  out += CLEAR_LINE + '\n';
+
+  if (!state.jobsList.length) {
+    out += CLEAR_LINE + `   ${DIM}No batch jobs yet. Submit some with: dikt batch <files…>${RESET}` + '\n';
+  } else {
+    // Cap the list to the available rows so it never overflows the screen.
+    const rows = process.stdout.rows || 24;
+    const maxRows = Math.max(3, rows - 8);
+    let list = state.jobsList;
+    let truncated = 0;
+    if (list.length > maxRows) { truncated = list.length - maxRows; list = list.slice(0, maxRows); }
+
+    for (let i = 0; i < list.length; i++) {
+      const rec = list[i];
+      const selected = i === state.jobsIndex;
+      const marker = selected ? `${GREEN}>${RESET}` : ' ';
+      const c = batchStatusColor(rec.status);
+      const n = rec.files?.length ?? 0;
+      const done = rec.completed_requests ?? 0;
+      const total = rec.total_requests ?? n;
+      const when = (rec.created || '').slice(0, 16).replace('T', ' ');
+      const id = `${BOLD}${shortId(rec.id)}${RESET}`;
+      const status = `${c}${(rec.status || '?').padEnd(15)}${RESET}`;
+      const meta = `${done}/${total}  ${DIM}${n} file${n === 1 ? '' : 's'} · ${when}${RESET}`;
+      const line = `${id}  ${status}  ${meta}`;
+      out += CLEAR_LINE + ` ${marker} ${selected ? line : DIM + stripAnsi(line) + RESET}` + '\n';
+    }
+    if (truncated) out += CLEAR_LINE + `   ${DIM}…and ${truncated} more${RESET}` + '\n';
+  }
+
+  out += CLEAR_LINE + '\n';
+  const sel = state.jobsList[state.jobsIndex];
+  if (state.jobsBusy) {
+    const sp = SPINNER[state.spinnerFrame % SPINNER.length];
+    out += CLEAR_LINE + `   ${YELLOW}${sp} ${state.jobsMsg || 'Working…'}${RESET}` + '\n';
+  } else if (state.jobsMsg) {
+    out += CLEAR_LINE + `   ${DIM}${state.jobsMsg}${RESET}` + '\n';
+  } else {
+    out += CLEAR_LINE + '\n';
+  }
+
+  out += CLEAR_LINE + '\n';
+  const fetchHint = sel && sel.status === 'SUCCESS' ? `${BOLD}[↵]${RESET} Fetch  ` : `${DIM}[↵] Fetch  ${RESET}`;
+  out += CLEAR_LINE + `   ${DIM}[↑↓]${RESET} Select  ${DIM}[r]${RESET} Refresh  ${fetchHint}${DIM}[x]${RESET} Cancel  ${DIM}[Esc]${RESET} Back` + '\n';
+  return out;
+}
+
+// Strip ANSI escapes (for dimming a pre-colored line without nesting codes).
+function stripAnsi(s) { return s.replace(/\x1b\[[0-9;]*m/g, ''); }
 
 function renderStatusLine() {
   process.stdout.write(moveTo(6) + CLEAR_LINE + renderStatus());
@@ -958,6 +1020,18 @@ function handleKey(str, key) {
       renderAll();
       break;
 
+    case 'jobs':
+      if (state.jobsBusy) break; // ignore input while an async action is in flight
+      if (key && key.name === 'escape') closeJobsView();
+      else if (ch === 'b') closeJobsView();
+      else if (ch === 'q') quit();
+      else if ((key && key.name === 'up') || ch === 'k') moveJobsSel(-1);
+      else if ((key && key.name === 'down') || ch === 'j') moveJobsSel(1);
+      else if (ch === 'r') refreshJobs();
+      else if (ch === 'f' || (key && key.name === 'return')) fetchSelectedJob();
+      else if (ch === 'x') cancelSelectedJob();
+      break;
+
     case 'recording':
       if (ch === ' ') stopRecording();
       else if (key && key.name === 'escape') cancelRecording();
@@ -980,11 +1054,118 @@ function handleKey(str, key) {
       else if (ch === 'c' || (key && key.name === 'return')) copy(state.transcript);
       else if (ch === 'a') toggleAutoCopy();
       else if (ch === 'h') cycleHistory();
+      else if (ch === 'b') openJobsView();
       else if (ch === 'r' && state.recFile) retranscribe();
       else if (ch === 's') runSetup();
       else if (ch === 'q') quit();
       break;
   }
+}
+
+// ── Batch jobs view (TUI) ─────────────────────────────────────────────────────
+
+function openJobsView() {
+  clearTimeout(state.copiedTimeout);
+  state.prevMode = state.mode === 'copied' ? 'ready' : state.mode;
+  state.jobsList = listBatchRecords();
+  state.jobsIndex = 0;
+  state.jobsMsg = '';
+  state.jobsBusy = false;
+  state.mode = 'jobs';
+  renderAll();
+}
+
+function closeJobsView() {
+  stopJobsSpinner();
+  state.mode = state.prevMode || 'idle';
+  state.prevMode = '';
+  state.jobsMsg = '';
+  renderAll();
+}
+
+function moveJobsSel(delta) {
+  if (!state.jobsList.length) return;
+  const n = state.jobsList.length;
+  state.jobsIndex = (state.jobsIndex + delta + n) % n;
+  state.jobsMsg = '';
+  renderAll();
+}
+
+function startJobsSpinner() {
+  stopJobsSpinner();
+  state.jobsSpinner = setInterval(() => { state.spinnerFrame++; renderAll(); }, 80);
+}
+function stopJobsSpinner() {
+  if (state.jobsSpinner) { clearInterval(state.jobsSpinner); state.jobsSpinner = null; }
+}
+
+async function refreshJobs() {
+  if (state.jobsBusy || !state.jobsList.length) return;
+  state.jobsBusy = true;
+  state.jobsMsg = 'Refreshing…';
+  startJobsSpinner();
+  let updated = 0;
+  for (const rec of state.jobsList) {
+    if (rec.status && BATCH_TERMINAL.has(rec.status)) continue; // terminal jobs won't change
+    try { const job = await fetchJob(rec.id); applyJobState(rec, job); saveBatchRecord(rec); updated++; } catch {}
+  }
+  stopJobsSpinner();
+  state.jobsBusy = false;
+  state.jobsMsg = updated ? `Refreshed ${updated} active job${updated === 1 ? '' : 's'}.` : 'All jobs up to date.';
+  renderAll();
+}
+
+async function fetchSelectedJob() {
+  if (state.jobsBusy) return;
+  const rec = state.jobsList[state.jobsIndex];
+  if (!rec) return;
+  state.jobsBusy = true;
+  state.jobsMsg = `Fetching ${shortId(rec.id)}…`;
+  startJobsSpinner();
+  try {
+    const job = await fetchJob(rec.id);
+    applyJobState(rec, job);
+    saveBatchRecord(rec);
+    if (rec.status !== 'SUCCESS') {
+      state.jobsMsg = `${shortId(rec.id)} is ${rec.status} — not ready to fetch.`;
+    } else {
+      const raw = await downloadBatchResults(rec);
+      const sum = applyBatchResults(rec, raw, {});
+      const where = sum.items.find((it) => it.outPath);
+      const dir = where ? path.dirname(where.outPath) : '';
+      state.jobsMsg = `${sum.written} written` + (sum.empty ? `, ${sum.empty} empty` : '') + (sum.failed ? `, ${sum.failed} failed` : '') + (dir ? ` → ${dir}` : '');
+    }
+  } catch (err) {
+    state.jobsMsg = `Error: ${err.message}`;
+  }
+  stopJobsSpinner();
+  state.jobsBusy = false;
+  renderAll();
+}
+
+async function cancelSelectedJob() {
+  if (state.jobsBusy) return;
+  const rec = state.jobsList[state.jobsIndex];
+  if (!rec) return;
+  if (rec.status && BATCH_TERMINAL.has(rec.status)) {
+    state.jobsMsg = `${shortId(rec.id)} is already ${rec.status}.`;
+    renderAll();
+    return;
+  }
+  state.jobsBusy = true;
+  state.jobsMsg = `Cancelling ${shortId(rec.id)}…`;
+  startJobsSpinner();
+  try {
+    const job = await apiJSON('POST', `/v1/batch/jobs/${rec.id}/cancel`);
+    applyJobState(rec, job);
+    saveBatchRecord(rec);
+    state.jobsMsg = `Cancellation requested (${rec.status}).`;
+  } catch (err) {
+    state.jobsMsg = `Error: ${err.message}`;
+  }
+  stopJobsSpinner();
+  state.jobsBusy = false;
+  renderAll();
 }
 
 async function retranscribe() {
@@ -1747,6 +1928,561 @@ async function runFileChunked(flags, { fileSize, duration }) {
   }
 }
 
+// ── Batch mode ────────────────────────────────────────────────────────────────
+//
+// Submits audio files to Mistral's async Batch API (~50% cheaper than the
+// realtime endpoint, but results arrive minutes-to-hours later). Each job is
+// persisted to ~/.config/dikt/batches/<job_id>.json so it can be polled and
+// fetched from any later invocation — even after closing the terminal.
+//
+// Lifecycle:
+//   1. upload each audio file       → file_id            (POST /v1/files purpose=audio)
+//   2. get a signed URL per file    → file_url           (GET  /v1/files/{id}/url)
+//   3. build a JSONL of requests, one line per file      ({custom_id, body})
+//   4. upload the JSONL             → input_file_id      (POST /v1/files purpose=batch)
+//   5. create the batch job                              (POST /v1/batch/jobs)
+//   6. poll the job until terminal                       (GET  /v1/batch/jobs/{id})
+//   7. download the output file & write one transcript per input
+
+const API_BASE = 'https://api.mistral.ai';
+const BATCH_ENDPOINT = '/v1/audio/transcriptions';
+const BATCH_TERMINAL = new Set(['SUCCESS', 'FAILED', 'TIMEOUT_EXCEEDED', 'CANCELLED']);
+
+// Low-level request returning { status, raw }. Mirrors the node:https usage in
+// callTranscribeAPI so we keep the zero-dependency, no-headersTimeout behaviour.
+function apiRequest(method, urlPath, { json, body, contentType } = {}) {
+  return new Promise((resolve, reject) => {
+    const url = urlPath.startsWith('http') ? urlPath : API_BASE + urlPath;
+    const headers = { Authorization: `Bearer ${config.apiKey}` };
+    let payload = body;
+    if (json !== undefined) {
+      payload = Buffer.from(JSON.stringify(json));
+      headers['Content-Type'] = 'application/json';
+    }
+    if (contentType) headers['Content-Type'] = contentType;
+    if (payload) headers['Content-Length'] = payload.length;
+
+    const req = https.request(url, { method, headers }, (res) => {
+      const chunks = [];
+      res.on('data', (c) => chunks.push(c));
+      res.on('end', () => resolve({ status: res.statusCode, raw: Buffer.concat(chunks).toString() }));
+      res.on('error', reject);
+    });
+    req.on('error', (err) => {
+      const ne = new Error(`Network error: ${err.message}`);
+      ne.networkError = true;
+      reject(ne);
+    });
+    if (payload) req.write(payload);
+    req.end();
+  });
+}
+
+// Build an Error from a non-2xx Mistral response body (same shape-handling as
+// the inline parser in callTranscribeAPI).
+function apiError(status, raw) {
+  let msg;
+  try {
+    const e = JSON.parse(raw);
+    msg = e.message;
+    if (typeof msg === 'object' && msg !== null) msg = JSON.stringify(msg);
+    if (!msg && Array.isArray(e.detail)) {
+      msg = e.detail.map((d) => [d.loc?.join('.'), d.msg].filter(Boolean).join(': ')).join('; ');
+    } else if (!msg && e.detail) {
+      msg = typeof e.detail === 'string' ? e.detail : JSON.stringify(e.detail);
+    }
+    if (!msg) msg = raw;
+  } catch {
+    msg = raw || `HTTP ${status}`;
+  }
+  const err = new Error(msg);
+  err.status = status;
+  return err;
+}
+
+async function apiJSON(method, urlPath, opts) {
+  const { status, raw } = await apiRequest(method, urlPath, opts);
+  if (status < 200 || status >= 300) throw apiError(status, raw);
+  return raw ? JSON.parse(raw) : {};
+}
+
+// Multipart upload to /v1/files. Reuses FormData → Request serialization (same
+// trick as callTranscribeAPI) so we don't hand-roll multipart boundaries.
+async function uploadToFiles(buffer, filename, purpose, mime = 'application/octet-stream') {
+  const fd = new FormData();
+  fd.append('purpose', purpose);
+  fd.append('file', new File([buffer], filename, { type: mime }));
+  const req = new Request(API_BASE + '/v1/files', {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${config.apiKey}` },
+    body: fd,
+  });
+  const contentType = req.headers.get('content-type');
+  const body = Buffer.from(await req.arrayBuffer());
+  const { status, raw } = await apiRequest('POST', '/v1/files', { body, contentType });
+  if (status < 200 || status >= 300) throw apiError(status, raw);
+  return JSON.parse(raw); // { id, ... }
+}
+
+async function getSignedUrl(fileId) {
+  const data = await apiJSON('GET', `/v1/files/${fileId}/url?expiry=24`);
+  return data.url;
+}
+
+// The per-file transcription request body. Mirrors the params appended in
+// callTranscribeAPI so batch output matches interactive/file output.
+function batchRequestBody(fileUrl, flags) {
+  const b = { model: config.model, file_url: fileUrl };
+  if (config.language) b.language = config.language;
+  if (config.temperature != null) b.temperature = config.temperature;
+  if (config.contextBias) b.context_bias = config.contextBias;
+  const granularities = [];
+  if (flags.timestamps) granularities.push(flags.timestamps);
+  if (flags.diarize) {
+    b.diarize = true;
+    if (!flags.timestamps) granularities.push('segment'); // API requires segments for diarization
+  }
+  if (granularities.length) b.timestamp_granularities = granularities;
+  return b;
+}
+
+// ── Batch job persistence ─────────────────────────────────────────────────────
+
+const BATCH_DIR = path.join(CONFIG_DIR, 'batches');
+
+function saveBatchRecord(rec) {
+  fs.mkdirSync(BATCH_DIR, { recursive: true });
+  fs.writeFileSync(path.join(BATCH_DIR, `${rec.id}.json`), JSON.stringify(rec, null, 2) + '\n', { mode: 0o600 });
+}
+
+function loadBatchRecord(id) {
+  try { return JSON.parse(fs.readFileSync(path.join(BATCH_DIR, `${id}.json`), 'utf8')); }
+  catch { return null; }
+}
+
+function listBatchRecords() {
+  try {
+    return fs.readdirSync(BATCH_DIR)
+      .filter((f) => f.endsWith('.json'))
+      .map((f) => { try { return JSON.parse(fs.readFileSync(path.join(BATCH_DIR, f), 'utf8')); } catch { return null; } })
+      .filter(Boolean)
+      .sort((a, b) => (b.created || '').localeCompare(a.created || ''));
+  } catch { return []; }
+}
+
+// Resolve a possibly-abbreviated job id to a full record. Accepts a unique
+// prefix so users don't have to paste the whole id.
+function resolveBatchRecord(id) {
+  if (!id) return null;
+  const exact = loadBatchRecord(id);
+  if (exact) return exact;
+  const matches = listBatchRecords().filter((r) => r.id.startsWith(id));
+  if (matches.length === 1) return matches[0];
+  if (matches.length > 1) {
+    process.stderr.write(`Ambiguous job id '${id}' matches ${matches.length} jobs.\n`);
+  }
+  return null;
+}
+
+// ── Batch helpers ─────────────────────────────────────────────────────────────
+
+const BATCH_AUDIO_EXTS = new Set(Object.keys(MIME_TYPES));
+
+// Expand the positional args into a concrete file list: directories expand to
+// the audio files inside them; everything else is taken literally (shell
+// globs already arrive pre-expanded as separate args).
+function expandBatchInputs(inputs) {
+  const files = [];
+  for (const input of inputs) {
+    let stat;
+    try { stat = fs.statSync(input); }
+    catch { process.stderr.write(`Skipping (not found): ${input}\n`); continue; }
+    if (stat.isDirectory()) {
+      const entries = fs.readdirSync(input)
+        .filter((f) => BATCH_AUDIO_EXTS.has(path.extname(f).slice(1).toLowerCase()))
+        .sort();
+      if (!entries.length) process.stderr.write(`No audio files in directory: ${input}\n`);
+      for (const f of entries) files.push(path.join(input, f));
+    } else {
+      files.push(input);
+    }
+  }
+  return files;
+}
+
+function shortId(id) { return id.length > 12 ? id.slice(0, 12) : id; }
+
+function batchStatusColor(status) {
+  if (status === 'SUCCESS') return GREEN;
+  if (status === 'RUNNING' || status === 'QUEUED') return YELLOW;
+  if (status === 'FAILED' || status === 'TIMEOUT_EXCEEDED') return RED;
+  return DIM;
+}
+
+// Merge the latest job state from the API into the local record.
+function applyJobState(rec, job) {
+  rec.status = job.status;
+  if (job.output_file) rec.output_file = job.output_file;
+  if (job.error_file) rec.error_file = job.error_file;
+  if (job.total_requests != null) rec.total_requests = job.total_requests;
+  if (job.completed_requests != null) rec.completed_requests = job.completed_requests;
+  if (job.failed_requests != null) rec.failed_requests = job.failed_requests;
+  return rec;
+}
+
+// ── Batch: submit ─────────────────────────────────────────────────────────────
+
+async function runBatchSubmit(inputs, flags) {
+  const files = expandBatchInputs(inputs);
+  if (!files.length) {
+    process.stderr.write('No input files. Usage: dikt batch <files…|directory>\n');
+    return EXIT_CONFIG;
+  }
+  // Validate up front so we fail before uploading anything.
+  for (const f of files) {
+    if (!fs.existsSync(f)) { process.stderr.write(`Error: file not found: ${f}\n`); return EXIT_TRANSCRIPTION; }
+  }
+
+  const spinner = createStderrSpinner();
+  try {
+    const records = [];
+    const requests = [];
+    spinner.start(`Uploading ${files.length} file${files.length > 1 ? 's' : ''}...`);
+
+    for (let i = 0; i < files.length; i++) {
+      const src = path.resolve(files[i]);
+      const ext = path.extname(src).slice(1).toLowerCase() || 'wav';
+      const mime = MIME_TYPES[ext] || 'application/octet-stream';
+      spinner.update(`Uploading ${i + 1}/${files.length}  ${DIM}${path.basename(src)}${RESET}`);
+
+      const buffer = fs.readFileSync(src);
+      const uploaded = await uploadToFiles(buffer, path.basename(src), 'audio', mime);
+      const fileUrl = await getSignedUrl(uploaded.id);
+
+      const customId = String(i);
+      records.push({ custom_id: customId, src, file_id: uploaded.id });
+      requests.push(JSON.stringify({ custom_id: customId, body: batchRequestBody(fileUrl, flags) }));
+    }
+
+    spinner.update('Creating batch job...');
+    const jsonl = requests.join('\n') + '\n';
+    const inputFile = await uploadToFiles(Buffer.from(jsonl), 'dikt-batch.jsonl', 'batch', 'application/jsonl');
+
+    const job = await apiJSON('POST', '/v1/batch/jobs', {
+      json: {
+        input_files: [inputFile.id],
+        model: config.model,
+        endpoint: BATCH_ENDPOINT,
+        metadata: { app: 'dikt', version: VERSION },
+      },
+    });
+
+    const rec = {
+      id: job.id,
+      created: new Date().toISOString(),
+      status: job.status || 'QUEUED',
+      model: config.model,
+      endpoint: BATCH_ENDPOINT,
+      files: records,
+      params: { diarize: !!flags.diarize, timestamps: flags.timestamps || '', json: !!flags.json },
+      outputDir: flags.outputDir || '',
+    };
+    applyJobState(rec, job);
+    saveBatchRecord(rec);
+
+    spinner.stop(`${GREEN}Submitted${RESET} ${files.length} file${files.length > 1 ? 's' : ''} — job ${BOLD}${shortId(job.id)}${RESET}`);
+    process.stderr.write(`  Status:  dikt batch --status ${shortId(job.id)}\n`);
+    process.stderr.write(`  Fetch:   dikt batch --fetch ${shortId(job.id)}   ${DIM}(once SUCCESS)${RESET}\n`);
+
+    if (flags.wait) {
+      process.stderr.write('\n');
+      return await waitForBatch(rec);
+    }
+    return EXIT_OK;
+  } catch (err) {
+    spinner.stop();
+    process.stderr.write(batchErrorMessage(err) + '\n');
+    return EXIT_TRANSCRIPTION;
+  }
+}
+
+function batchErrorMessage(err) {
+  const parts = [`Error: ${err.message}`];
+  if (err.networkError) parts.push('  Hint: check your network connection and try again');
+  else if (err.status === 401) parts.push('  Hint: invalid API key — run `dikt setup` to reconfigure');
+  else if (err.status === 429) parts.push('  Hint: rate limited — wait a moment and try again');
+  else if (err.status >= 500) parts.push('  Hint: Mistral API server error — try again later');
+  return parts.join('\n');
+}
+
+// ── Batch: poll / wait ────────────────────────────────────────────────────────
+
+async function fetchJob(id) {
+  return apiJSON('GET', `/v1/batch/jobs/${id}`);
+}
+
+async function waitForBatch(rec) {
+  const spinner = createStderrSpinner();
+  const t0 = Date.now();
+  const elapsed = () => { const s = Math.floor((Date.now() - t0) / 1000); return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`; };
+  spinner.start('Waiting for batch...');
+  let aborted = false;
+  const onSigint = () => { aborted = true; };
+  process.on('SIGINT', onSigint);
+  try {
+    while (!aborted) {
+      const job = await fetchJob(rec.id);
+      applyJobState(rec, job);
+      saveBatchRecord(rec);
+      const done = rec.completed_requests ?? 0;
+      const total = rec.total_requests ?? rec.files.length;
+      spinner.update(`${rec.status} ${DIM}${done}/${total} · ${elapsed()}${RESET}`);
+      if (BATCH_TERMINAL.has(rec.status)) break;
+      await new Promise((r) => setTimeout(r, 10000)); // poll every 10s
+    }
+  } finally {
+    process.removeListener('SIGINT', onSigint);
+  }
+  if (aborted) {
+    spinner.stop(`${DIM}Detached. Resume with: dikt batch --fetch ${shortId(rec.id)}${RESET}`);
+    return EXIT_OK;
+  }
+  spinner.stop(`${batchStatusColor(rec.status)}${rec.status}${RESET}`);
+  if (rec.status === 'SUCCESS') return writeBatchOutputs(rec, { json: rec.params.json });
+  process.stderr.write(`Job ${shortId(rec.id)} ended with status ${rec.status}.\n`);
+  return EXIT_TRANSCRIPTION;
+}
+
+// ── Batch: status ─────────────────────────────────────────────────────────────
+
+async function runBatchStatus(id) {
+  const rec = resolveBatchRecord(id);
+  if (!rec) { process.stderr.write(`No tracked job for '${id}'. Run \`dikt batch --list\`.\n`); return EXIT_CONFIG; }
+  try {
+    const job = await fetchJob(rec.id);
+    applyJobState(rec, job);
+    saveBatchRecord(rec);
+  } catch (err) {
+    process.stderr.write(batchErrorMessage(err) + '\n');
+    return EXIT_TRANSCRIPTION;
+  }
+  const done = rec.completed_requests ?? 0;
+  const total = rec.total_requests ?? rec.files.length;
+  const c = batchStatusColor(rec.status);
+  process.stdout.write(`${BOLD}${shortId(rec.id)}${RESET}  ${c}${rec.status}${RESET}  ${done}/${total} done`);
+  if (rec.failed_requests) process.stdout.write(`  ${RED}${rec.failed_requests} failed${RESET}`);
+  process.stdout.write('\n');
+  if (rec.status === 'SUCCESS') process.stderr.write(`  Fetch: dikt batch --fetch ${shortId(rec.id)}\n`);
+  return EXIT_OK;
+}
+
+// ── Batch: list ───────────────────────────────────────────────────────────────
+
+function runBatchList() {
+  const recs = listBatchRecords();
+  if (!recs.length) { process.stderr.write('No batch jobs tracked yet.\n'); return EXIT_OK; }
+  for (const rec of recs) {
+    const c = batchStatusColor(rec.status);
+    const when = (rec.created || '').slice(0, 16).replace('T', ' ');
+    const n = rec.files?.length ?? 0;
+    process.stdout.write(`${BOLD}${shortId(rec.id)}${RESET}  ${c}${(rec.status || '?').padEnd(16)}${RESET}  ${String(n).padStart(3)} file${n === 1 ? ' ' : 's'}  ${DIM}${when}${RESET}\n`);
+  }
+  return EXIT_OK;
+}
+
+// ── Batch: cancel ─────────────────────────────────────────────────────────────
+
+async function runBatchCancel(id) {
+  const rec = resolveBatchRecord(id);
+  if (!rec) { process.stderr.write(`No tracked job for '${id}'.\n`); return EXIT_CONFIG; }
+  try {
+    const job = await apiJSON('POST', `/v1/batch/jobs/${rec.id}/cancel`);
+    applyJobState(rec, job);
+    saveBatchRecord(rec);
+    process.stderr.write(`${YELLOW}Cancellation requested${RESET} for ${shortId(rec.id)} (status ${rec.status}).\n`);
+    return EXIT_OK;
+  } catch (err) {
+    process.stderr.write(batchErrorMessage(err) + '\n');
+    return EXIT_TRANSCRIPTION;
+  }
+}
+
+// ── Batch: fetch / write outputs ──────────────────────────────────────────────
+
+async function runBatchFetch(id, opts = {}) {
+  const rec = resolveBatchRecord(id);
+  if (!rec) { process.stderr.write(`No tracked job for '${id}'. Run \`dikt batch --list\`.\n`); return EXIT_CONFIG; }
+  try {
+    const job = await fetchJob(rec.id);
+    applyJobState(rec, job);
+    saveBatchRecord(rec);
+  } catch (err) {
+    process.stderr.write(batchErrorMessage(err) + '\n');
+    return EXIT_TRANSCRIPTION;
+  }
+  if (rec.status !== 'SUCCESS') {
+    process.stderr.write(`Job ${shortId(rec.id)} is ${rec.status}, not ready to fetch.\n`);
+    return rec.status === 'FAILED' || rec.status === 'TIMEOUT_EXCEEDED' ? EXIT_TRANSCRIPTION : EXIT_OK;
+  }
+  return writeBatchOutputs(rec, opts);
+}
+
+// Parse one result line from the batch output JSONL. Mistral wraps each result
+// as { custom_id, response: { status_code, body }, error }, where body is the
+// usual transcription payload. Handle the envelope plus a few failure shapes:
+// a top-level error, an error embedded in the body, or a non-2xx status_code.
+function batchLineResult(line) {
+  const obj = JSON.parse(line);
+  const resp = obj.response;
+  const body = resp?.body ?? obj.body ?? obj;
+  let error = obj.error || body?.error || null;
+  if (!error && resp && resp.status_code != null && resp.status_code >= 400) {
+    error = body?.message || `HTTP ${resp.status_code}`;
+  }
+  return { customId: String(obj.custom_id), body, error };
+}
+
+// Download the raw output JSONL for a successful job. Throws on HTTP error.
+async function downloadBatchResults(rec) {
+  if (!rec.output_file) throw new Error('Job has no output file');
+  const res = await apiRequest('GET', `/v1/files/${rec.output_file}/content`);
+  if (res.status < 200 || res.status >= 300) throw apiError(res.status, res.raw);
+  return res.raw;
+}
+
+// Parse the output JSONL and write one transcript file per input. Returns a
+// summary (no printing) so both the CLI and the TUI can report it their own way.
+function applyBatchResults(rec, raw, { json, outputDir } = {}) {
+  const wantJson = json != null ? json : rec.params.json;
+  const baseDir = outputDir || rec.outputDir || '';
+  const byId = new Map(rec.files.map((f) => [f.custom_id, f]));
+  const items = [];
+  let written = 0, empty = 0, failed = 0;
+
+  for (const line of raw.split('\n')) {
+    if (!line.trim()) continue;
+    let parsed;
+    try { parsed = batchLineResult(line); } catch { continue; }
+    const file = byId.get(parsed.customId);
+    if (!file) continue;
+    const name = path.basename(file.src);
+
+    if (parsed.error) {
+      failed++;
+      items.push({ name, error: typeof parsed.error === 'string' ? parsed.error : JSON.stringify(parsed.error) });
+      continue;
+    }
+
+    const text = (parsed.body?.text || '').trim();
+    if (!text) { empty++; items.push({ name, empty: true }); continue; }
+
+    const wordCount = text.split(/\s+/).filter(Boolean).length;
+    let output;
+    if (wantJson) {
+      const out = buildJsonOutput(
+        { text, words: wordCount, source: file.src },
+        { segments: parsed.body.segments, words: parsed.body.words, timestamps: rec.params.timestamps, diarize: rec.params.diarize },
+      );
+      output = JSON.stringify(out, null, 2) + '\n';
+    } else if (rec.params.diarize && parsed.body.segments) {
+      output = formatDiarizedText(parsed.body.segments) + '\n';
+    } else {
+      output = text + '\n';
+    }
+
+    const base = path.basename(file.src, path.extname(file.src));
+    const dir = baseDir || path.dirname(file.src);
+    const outPath = path.join(dir, `${base}.${wantJson ? 'json' : 'txt'}`);
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(outPath, output);
+    written++;
+    items.push({ name, outPath });
+  }
+
+  return { written, empty, failed, items };
+}
+
+async function writeBatchOutputs(rec, opts = {}) {
+  const spinner = createStderrSpinner();
+  spinner.start('Downloading results...');
+  let raw;
+  try {
+    raw = await downloadBatchResults(rec);
+  } catch (err) {
+    spinner.stop();
+    process.stderr.write(batchErrorMessage(err) + '\n');
+    return EXIT_TRANSCRIPTION;
+  }
+  spinner.stop();
+
+  const sum = applyBatchResults(rec, raw, opts);
+  for (const it of sum.items) {
+    if (it.error) process.stderr.write(`${RED}✗${RESET} ${it.name}: ${it.error}\n`);
+    else if (it.empty) process.stderr.write(`${DIM}∅${RESET} ${it.name}: no speech detected\n`);
+    else process.stderr.write(`${GREEN}✓${RESET} ${it.outPath}\n`);
+  }
+  process.stderr.write(`\n${sum.written} written` + (sum.empty ? `, ${sum.empty} empty` : '') + (sum.failed ? `, ${RED}${sum.failed} failed${RESET}` : '') + '.\n');
+  return sum.failed && !sum.written ? EXIT_TRANSCRIPTION : EXIT_OK;
+}
+
+// ── Batch: dispatch ───────────────────────────────────────────────────────────
+
+async function runBatch(args) {
+  // Batch parses its own args (positional file list + a few flags), so it
+  // runs before main()'s strict flag validation. Load config independently.
+  config = loadConfig();
+  if (!config) {
+    process.stderr.write('No config found. Run `dikt setup` first.\n');
+    return EXIT_CONFIG;
+  }
+  applyEnvOverrides(config);
+  const validation = validateConfig(config);
+  if (!validation.valid) {
+    for (const e of validation.errors) process.stderr.write(`Config error: ${e}\n`);
+    return EXIT_CONFIG;
+  }
+
+  const valueFlags = new Set(['--status', '--fetch', '--cancel', '--timestamps', '--language', '--output-dir', '-o']);
+  const has = (f) => args.includes(f);
+  const val = (f) => { const i = args.indexOf(f); return i >= 0 ? (args[i + 1] || '') : ''; };
+
+  if (has('--list')) return runBatchList();
+  if (has('--status')) return runBatchStatus(val('--status'));
+  if (has('--cancel')) return runBatchCancel(val('--cancel'));
+  if (has('--fetch')) {
+    return runBatchFetch(val('--fetch'), {
+      json: has('--json') ? true : null,
+      outputDir: val('--output-dir') || val('-o'),
+    });
+  }
+
+  // Otherwise: submit. Collect positional file args, skipping flag values.
+  const inputs = [];
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    if (a.startsWith('-')) { if (valueFlags.has(a)) i++; continue; }
+    inputs.push(a);
+  }
+
+  const flags = {
+    wait: has('--wait'),
+    json: has('--json'),
+    diarize: has('--diarize') || !!config.diarize,
+    timestamps: val('--timestamps') || (config.timestamps === 'segment,word' ? 'word' : config.timestamps) || '',
+    language: val('--language'),
+    outputDir: val('--output-dir') || val('-o'),
+  };
+  if (flags.language) config.language = flags.language;
+  // diarize and language are mutually exclusive on the transcription endpoint.
+  if (flags.diarize && config.language) config.language = '';
+
+  if (!inputs.length) {
+    process.stderr.write('Usage: dikt batch <files…|directory> [--wait] [--diarize] [--json] [-o <dir>]\n       dikt batch --list | --status <id> | --fetch <id> | --cancel <id>\n');
+    return EXIT_CONFIG;
+  }
+  return runBatchSubmit(inputs, flags);
+}
+
 // ── Single-shot mode ──────────────────────────────────────────────────────────
 
 async function runOnce(flags) {
@@ -1978,6 +2714,7 @@ async function runStream(flags) {
 function quit() {
   clearInterval(state.timerInterval);
   clearInterval(state.spinnerInterval);
+  clearInterval(state.jobsSpinner);
   clearTimeout(state.copiedTimeout);
 
   if (state.recProc) {
@@ -2031,6 +2768,12 @@ async function main() {
     output: flagVal(args, '--output', 'path') || flagVal(args, '-o', 'path'),
   };
 
+  // Batch mode dispatches early: it has its own positional-file arg parsing
+  // that the strict validator below would otherwise reject.
+  if (args[0] === 'batch') {
+    process.exit(await runBatch(args.slice(1)));
+  }
+
   // Reject unknown flags and arguments
   const knownFlags = new Set([
     '--json', '--quiet', '-q', '--no-input', '--setup', '--stream',
@@ -2039,7 +2782,7 @@ async function main() {
     '--silence', '--pause', '--language', '--file', '--timestamps',
     '--output', '-o',
   ]);
-  const knownCommands = new Set(['setup', 'update']);
+  const knownCommands = new Set(['setup', 'update', 'batch']);
   const valueTakers = new Set(['--silence', '--pause', '--language', '--file', '--timestamps', '--output', '-o']);
   for (let i = 0; i < args.length; i++) {
     const a = args[i];
@@ -2089,6 +2832,7 @@ Usage: dikt [options] [command]
 Commands:
   setup                      Reconfigure API key and model
   update                     Update dikt to the latest version
+  batch <files…|dir>         Submit files to the async Batch API (~50% cheaper)
 
 Options:
   --setup                    Run setup wizard
@@ -2133,6 +2877,16 @@ Examples:
   dikt --stream --silence 0  Stream continuously until Ctrl+C
   dikt --stream -n           Stream as continuous flowing text
   dikt -q --json --diarize   Transcribe with speaker labels
+
+Batch (async, ~50% cheaper — results arrive minutes-to-hours later):
+  dikt batch *.wav           Submit files; prints a job id and exits
+  dikt batch ./recordings    Submit every audio file in a directory
+  dikt batch *.mp3 --wait    Submit, then block until done and write outputs
+  dikt batch --list          List tracked jobs and their status
+  dikt batch --status <id>   Poll one job's status
+  dikt batch --fetch <id>    Download results (writes <name>.txt next to source)
+  dikt batch --cancel <id>   Cancel a queued/running job
+    Flags: --diarize, --timestamps, --json, --language, -o <dir>
 
 Environment variables:
   DIKT_API_KEY               Override API key from config

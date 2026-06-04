@@ -54,6 +54,7 @@ This opens an interactive TUI where you can record, transcribe, and copy text.
 | `c` / `Enter` | Copy transcript to clipboard |
 | `a` | Toggle auto-copy |
 | `h` | Cycle through history |
+| `b` | Batch jobs view (list / refresh / fetch / cancel) |
 | `r` | Re-transcribe last recording |
 | `Esc` | Cancel recording |
 | `s` | Re-run setup |
@@ -112,6 +113,37 @@ dikt --file https://youtube.com/watch?v=VIDEO_ID
 dikt --file https://youtube.com/watch?v=VIDEO_ID -o transcript.txt
 ```
 
+### Batch mode
+
+Transcribe many files at once through Mistral's async [Batch API](https://docs.mistral.ai/capabilities/batch/) — roughly **50% cheaper** than realtime, at the cost of latency (results arrive minutes to hours later, within a 24h window). Jobs are submitted and detached: dikt persists each job to `~/.config/dikt/batches/` so you can close the terminal and fetch results later.
+
+```bash
+# Submit files — prints a job id and exits immediately
+dikt batch *.wav
+
+# Submit every audio file in a directory
+dikt batch ./recordings
+
+# Submit and block until done, then write outputs
+dikt batch *.mp3 --wait
+
+# Check on jobs
+dikt batch --list
+dikt batch --status <id>
+
+# Download results once SUCCESS (writes <name>.txt next to each source)
+dikt batch --fetch <id>
+dikt batch --fetch <id> --json        # write <name>.json instead
+dikt batch --fetch <id> -o ./out      # write into a directory
+
+# Cancel a queued/running job
+dikt batch --cancel <id>
+```
+
+`--diarize`, `--timestamps`, `--language`, and `--json` work the same as in other modes. Job ids may be abbreviated to any unique prefix.
+
+You can also manage jobs from the interactive TUI: press `b` to open the **batch jobs view**, where `↑`/`↓` selects a job, `r` refreshes status, `Enter` fetches a completed job, and `x` cancels one.
+
 ### Speaker identification & timestamps
 
 ```bash
@@ -131,6 +163,7 @@ dikt -q --json --diarize
 
 | Flag | Description |
 |---|---|
+| `batch <files\|dir>` | Submit files to the async Batch API (~50% cheaper) |
 | `--file <path\|url>` | Transcribe audio file or URL (via yt-dlp) |
 | `-o`, `--output <path>` | Write output to file (`.json` auto-enables JSON) |
 | `--stream` | Stream transcription chunks on pauses |
